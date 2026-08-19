@@ -7,6 +7,7 @@ and group — through one model.
 | --- | --- |
 | Model | `@sntxrr/gitlab-token` |
 | Methods | `sync`, `list`, `create`, `rotate`, `delete` |
+| Workflow | `@sntxrr/gitlab-token-rotation` — daily check, threshold-gated rotation |
 | Writes | `token` (metadata) per token, `secret` (vaulted value) on create/rotate |
 | Auth | A GitLab token with `api` scope, sent as `PRIVATE-TOKEN` |
 
@@ -137,6 +138,46 @@ swamp model @sntxrr/gitlab-token method run delete deploy-token
 
 Already-revoked is treated as success. The desired state is "gone", and a
 cleanup job that fails on its second run is one nobody schedules.
+
+## The rotation workflow
+
+The extension ships `@sntxrr/gitlab-token-rotation`, a two-job workflow that
+checks the managed token daily and rotates it only when told to *and* only when
+it is genuinely close to lapsing.
+
+```bash
+# scheduled path — read-only, keeps daysRemaining current
+swamp workflow run @sntxrr/gitlab-token-rotation
+
+# rotate, if the token is inside the threshold
+swamp workflow run @sntxrr/gitlab-token-rotation --input rotate=true
+```
+
+| Input | Default | Effect |
+| --- | --- | --- |
+| `rotate` | `false` | Permit rotation at all. The default makes the scheduled run read-only. |
+| `rotateWithinDays` | `7` | Rotate only at or below this many days remaining. |
+| `expiresAt` | `""` | Expiry for the replacement, `YYYY-MM-DD`. Empty takes GitLab's default. |
+
+**Two independent gates, both of which must hold.** `rotate=true` alone does
+nothing to a token with 60 days left, so re-running the workflow by hand cannot
+mint a fresh token every invocation. That matters more than it sounds: rotation
+is irreversible the instant it lands, and a workflow that rotates on every run
+is one that quietly burns a token family.
+
+Both conditions are evaluated in the model's `when` argument rather than a step
+condition, because swamp step conditions are status-based and cannot express a
+predicate over another step's output. A false `when` costs nothing — `rotate`
+returns before it touches the API and writes no resource, so the existing
+snapshot stays true instead of gaining a generation that was never issued.
+
+The predicate uses `data.findBySpec` rather than `data.latest` because this
+model keys each snapshot by the token's real GitLab ID, so the instance name is
+not knowable when the workflow file is written.
+
+**Wire the consumer before enabling rotation.** The replacement value lands in
+the `secret` resource and nowhere else. A rotation whose output nothing reads is
+an outage you scheduled.
 
 ## Global arguments
 

@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/gitlab-token",
+  "version": "2026.08.19.2",
+  "reviewedAt": "2026-08-19T20:10:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Exactly two fields carry a token value and both are .meta({sensitive:true}): the GlobalArgs auth token and SecretSchema.token. toTokenResource deliberately drops the `token` field present on create/rotate responses, asserted by a test that fails if the value appears anywhere in the metadata snapshot. A second test asserts the value never reaches the log buffer. The 9 credentials-sensitive-field analyzer warnings are false positives: the heuristic fires on tokenId/userId/id/name/description/search, which are numeric GitLab IDs and free text, in a model whose whole subject is tokens."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "All five methods log info on entry and on completion with structured placeholders, no string interpolation. warn is used for the two degraded paths (create or rotate returning no value). Review found list logging only completion; an entry log was added. No secret is logged on any path."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "gitlabFetch throws before any writeResource, so no partial write survives a failure. Errors carry method, path, status and response body, and are tagged transient for 429/503. The only catch is in delete, narrowed to status 404 and re-throwing everything else; a test asserts a 403 still fails."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "36 tests over mocked fetch, 4 new for this revision. The when=false paths are asserted to spend NO API call and write NO resource, including the case where tokenId is `self` \u2014 the guard must precede the resolving GET or a false predicate still costs a call and can still fail the step. Existing rotate/delete call sites were updated to pass `when` explicitly, matching the sibling @sntxrr/apprise-notify tests."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "delete treats 404 as success. New in this revision: rotate and delete accept a `when` argument, and a false predicate returns before touching the API and writes nothing at all. Writing a snapshot on skip would have been worse than useless \u2014 it would claim a token generation that was never issued and corrupt the inventory. create remains inherently non-idempotent because GitLab permits duplicate token names and returns no 409; the one-time-disclosure orphan window is unchanged and unavoidable, with list as the recovery path."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Every endpoint, verb and body field was verified against the live GitLab docs for all three token families during this build, including the split personal-token creation endpoints. Response fields are read with defensive casts and null fallbacks rather than assumed present. Pagination follows x-next-page rather than a short-page heuristic, which would stop early on an exactly-full final page. 429/503 are retried with Retry-After honored and capped."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No file handles, sockets or temp files; fetch only, with AbortSignal.timeout bounding every request including error paths. Created resources are tracked by their real GitLab ID in the token snapshot, so an orphan can be found and revoked."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Re-reviewed for the workflow added in this revision. It references the model instance by the generic name `gitlab-token` and carries no hostnames, namespaces or credentials of any kind. README examples continue to use gitlab.example.com and the fictional marsh-works/deploy-bot. No IPv4 literals, internal hostnames, CIDRs or account identifiers in any shipped file."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Both resource schemas are plain z.object with every field declared and described; no .passthrough(), so CEL expression validation resolves attributes."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "token: lifetime infinite, garbageCollection 30 \u2014 inventory history is worth keeping across rotations. secret: lifetime infinite, garbageCollection 10 \u2014 deliberately shallower, since retaining many superseded token values widens the blast radius for no benefit."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "sync, create, delete and the list factory are all present, plus rotate. There is deliberately no update: GitLab access tokens are immutable \u2014 scopes, expiry and access level cannot be changed after issue and the API exposes no PATCH/PUT. Rotation, not mutation, is the supported way to change a token, and the shipped workflow orchestrates exactly that."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "issue",
+      "note": "valid-target is labeled [\"policy\"] and rejects a project/group scope with no namespace, a namespace on a personal scope, and a baseUrl that is relative or already contains /api/v4. It still does NOT auto-fire before rotate, because swamp triggers checks only on methods named create/update/delete/action and renaming rotate would misdescribe it. This revision reduces rather than removes the exposure: rotate now takes a `when` argument, so the shipped workflow gates it on both an explicit opt-in and a days-remaining threshold, and requireTokenId and collectionPath still throw the same actionable messages before any request is sent. Recorded again as a known limitation of the name-based trigger rather than an unguarded path."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Every method now keys snapshots by the token's real GitLab ID. Review found delete violating this when tokenId was the literal `self`: revoke returns 204 with no body, so unlike sync and rotate it could not learn the real ID from its own response and wrote a snapshot named \"self\", filing one token under two names and breaking drift reconciliation against sync/list. Fixed by resolving self via a GET before revoking, with a regression test asserting the DELETE targets the resolved ID. rotate keys by the NEW id, so a retired generation is not overwritten by its successor. create/rotate do write token and secret under the same instance name, which is intentional: it is the same real resource ID in two different specs, matching the \"instance-name = the resource's real ID, everywhere\" convention, and the specs namespace separately so nothing collides."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "dataRepository is never touched directly. No method reads back stored state: sync, delete and list read live API state instead, which is the correct source for drift detection \u2014 reading the datastore would report what was last recorded rather than what GitLab currently holds."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "na",
+      "note": "No upgrades entry is required for 2026.08.19.1 to 2026.08.19.2. The change adds a `when` argument to two METHOD argument schemas, both defaulted to true so existing callers are unaffected, and ships a workflow. Method arguments are not stored resource data, and no resource schema field changed shape, type or meaning, so there is nothing to migrate."
+    }
+  ]
+}

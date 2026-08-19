@@ -388,7 +388,7 @@ Deno.test("rotate keys the snapshot by the NEW id, not the rotated-from id", asy
         { status: 200 },
       );
     },
-    () => model.methods.rotate.execute({}, ctx),
+    () => model.methods.rotate.execute({ when: true }, ctx),
   );
   assertStringIncludes(url, "/personal_access_tokens/42/rotate");
   assertEquals(writes.find((w) => w.spec === "token")!.name, "99");
@@ -405,7 +405,7 @@ Deno.test("rotate passes expires_at through when given", async () => {
         status: 200,
       });
     },
-    () => model.methods.rotate.execute({ expiresAt: "2026-12-01" }, ctx),
+    () => model.methods.rotate.execute({ expiresAt: "2026-12-01", when: true }, ctx),
   );
   assertEquals(body.expires_at, "2026-12-01");
 });
@@ -416,7 +416,7 @@ Deno.test("rotate warns loudly when no replacement value comes back", async () =
   const { ctx, writes, logs } = makeContext(G);
   await withMockedFetch(
     () => new Response(JSON.stringify({ id: 99 }), { status: 200 }),
-    () => model.methods.rotate.execute({}, ctx),
+    () => model.methods.rotate.execute({ when: true }, ctx),
   );
   assertEquals(writes.filter((w) => w.spec === "secret").length, 0);
   assert(
@@ -435,7 +435,7 @@ Deno.test("delete revokes and records the post-state", async () => {
       captured = { url, init };
       return new Response(null, { status: 204 });
     },
-    () => model.methods.delete.execute({}, ctx),
+    () => model.methods.delete.execute({ when: true }, ctx),
   );
   const call = captured as unknown as { url: string; init: RequestInit };
   assertEquals(call.init.method, "DELETE");
@@ -447,7 +447,7 @@ Deno.test("delete treats an already-revoked token as success", async () => {
   const { ctx, writes } = makeContext(G);
   await withMockedFetch(
     () => new Response('{"message":"404 Not found"}', { status: 404 }),
-    () => model.methods.delete.execute({}, ctx),
+    () => model.methods.delete.execute({ when: true }, ctx),
   );
   assertEquals(writes.length, 1);
   assertEquals(writes[0].data.revoked, true);
@@ -459,7 +459,7 @@ Deno.test("delete still fails on a permissions error", async () => {
     () => new Response('{"message":"403 Forbidden"}', { status: 403 }),
     async () => {
       await assertRejects(
-        () => model.methods.delete.execute({}, ctx),
+        () => model.methods.delete.execute({ when: true }, ctx),
         Error,
         "403",
       );
@@ -627,7 +627,7 @@ Deno.test("delete resolves the self keyword to the real id before revoking", asy
       }
       return new Response(null, { status: 204 });
     },
-    () => model.methods.delete.execute({}, ctx),
+    () => model.methods.delete.execute({ when: true }, ctx),
   );
   assertEquals(calls[0].method, "GET");
   assertStringIncludes(calls[0].url, "/personal_access_tokens/self");
@@ -646,8 +646,70 @@ Deno.test("delete by explicit id makes no resolving call", () => {
       methods.push(String(init.method ?? "GET"));
       return new Response(null, { status: 204 });
     },
-    () => model.methods.delete.execute({}, ctx),
+    () => model.methods.delete.execute({ when: true }, ctx),
   ).then(() => {
     assertEquals(methods, ["DELETE"]);
   });
+});
+
+// --- Conditional execution (`when`) -----------------------------------------
+
+Deno.test("rotate with when=false spends no API call and writes nothing", async () => {
+  // Rotation is irreversible the instant it lands, so a false predicate must
+  // cost nothing rather than be undone. Nothing is written either: the existing
+  // snapshot is still true, and a new one would claim a generation that was
+  // never issued.
+  const { ctx, writes, logs } = makeContext(G);
+  let called = false;
+  await withMockedFetch(
+    () => {
+      called = true;
+      return new Response("{}", { status: 200 });
+    },
+    () => model.methods.rotate.execute({ when: false }, ctx),
+  );
+  assert(!called, "when=false must not reach the API");
+  assertEquals(writes.length, 0);
+  assert(logs.some((l) => l.includes("Condition was false")));
+});
+
+Deno.test("rotate with when=true rotates normally", async () => {
+  const { ctx, writes } = makeContext(G);
+  await withMockedFetch(
+    () =>
+      new Response(JSON.stringify({ id: 99, token: "glpat-rotated" }), {
+        status: 200,
+      }),
+    () => model.methods.rotate.execute({ when: true }, ctx),
+  );
+  assertEquals(writes.filter((w) => w.spec === "secret").length, 1);
+});
+
+Deno.test("delete with when=false revokes nothing", async () => {
+  const { ctx, writes } = makeContext(G);
+  let called = false;
+  await withMockedFetch(
+    () => {
+      called = true;
+      return new Response(null, { status: 204 });
+    },
+    () => model.methods.delete.execute({ when: false }, ctx),
+  );
+  assert(!called, "when=false must not reach the API");
+  assertEquals(writes.length, 0);
+});
+
+Deno.test("delete with when=false skips before resolving the self keyword", async () => {
+  // The guard must precede the resolving GET, or a false predicate still costs
+  // a call and can still fail the step.
+  const { ctx } = makeContext({ ...G, tokenId: "self" });
+  let called = false;
+  await withMockedFetch(
+    () => {
+      called = true;
+      return new Response(JSON.stringify({ id: 1 }), { status: 200 });
+    },
+    () => model.methods.delete.execute({ when: false }, ctx),
+  );
+  assert(!called, "the skip must short-circuit the self-resolution GET too");
 });

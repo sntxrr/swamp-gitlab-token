@@ -1,12 +1,15 @@
 manifestVersion: 1
 
 name: "@sntxrr/gitlab-token"
-version: "2026.08.19.1"
-description: "Create, rotate, revoke and inventory GitLab personal, project and group access tokens through one model, with the one-time token value written to a vaulted sensitive field"
+version: "2026.08.19.2"
+description: "Create, rotate, revoke and inventory GitLab personal, project and group access tokens through one model, with a threshold-gated rotation workflow and the one-time token value written to a vaulted sensitive field"
 repository: "https://github.com/sntxrr/swamp-gitlab-token"
 
 models:
   - gitlab_token.ts
+
+workflows:
+  - workflow-gitlab-token-rotation.yaml
 
 additionalFiles:
   - README.md
