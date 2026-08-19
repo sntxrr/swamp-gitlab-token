@@ -264,6 +264,14 @@ async function gitlabFetch<T>(
 }
 
 /**
+ * Ceiling on the pagination walk. At the default page size this is 10,000
+ * tokens in one namespace — far beyond any real estate, so hitting it means
+ * the walk is not terminating rather than that the collection is genuinely
+ * that large.
+ */
+const MAX_PAGES = 100;
+
+/**
  * Follow GitLab's `x-next-page` header to the end of a collection.
  *
  * GitLab signals "no more pages" with an empty `x-next-page`, not with a short
@@ -279,7 +287,7 @@ async function gitlabListAll<T>(
   let page = "1";
   // Bound the walk: a malformed x-next-page that never clears would otherwise
   // page forever against a live instance.
-  for (let guard = 0; guard < 100; guard++) {
+  for (let guard = 0; guard < MAX_PAGES; guard++) {
     const sep = path.includes("?") ? "&" : "?";
     const { data, headers } = await gitlabFetch<T[]>(
       g,
@@ -288,10 +296,19 @@ async function gitlabListAll<T>(
     );
     items.push(...(data ?? []));
     const next = headers.get("x-next-page");
-    if (!next) break;
+    if (!next) return items;
     page = next;
   }
-  return items;
+  // Falling out of the loop means the cap was hit with pages still to come.
+  // Returning what we have would present a partial inventory as a complete
+  // one — the precise failure an access-token audit exists to prevent, and one
+  // that reports success while under-counting. Fail loudly instead.
+  throw new Error(
+    `GitLab pagination for ${path} exceeded ${MAX_PAGES} pages ` +
+      `(${items.length} records read) and did not terminate. Refusing to ` +
+      `report a partial inventory as a complete one — narrow the query with ` +
+      `the search or expiresBefore filters.`,
+  );
 }
 
 // --- Context types ---------------------------------------------------------
@@ -711,7 +728,30 @@ export const model = {
         context: ExecuteContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const { globalArgs: g, logger } = context;
-        const tokenId = requireTokenId(g, "delete");
+        const configured = requireTokenId(g, "delete");
+
+        // `self` is a keyword, not an id. Revoke returns 204 with no body, so
+        // unlike sync and rotate this method cannot learn the real id from its
+        // own response — it must resolve it first. Keying the snapshot "self"
+        // would file the same token under two names, and drift reconciliation
+        // against sync/list would never match.
+        let tokenId = configured;
+        if (configured === "self") {
+          const { data } = await gitlabFetch<Record<string, unknown>>(
+            g,
+            "GET",
+            tokenPath(g, "self"),
+          );
+          tokenId = String(data.id ?? "");
+          if (!tokenId) {
+            throw new Error(
+              `Could not resolve "self" to a token ID before revoking; ` +
+                `GitLab returned no id. Set globalArgs.tokenId explicitly.`,
+            );
+          }
+          logger.info("Resolved self to GitLab token {id}", { id: tokenId });
+        }
+
         logger.info("Revoking GitLab {scope} token {id}", {
           scope: g.tokenScope,
           id: tokenId,
@@ -768,6 +808,10 @@ export const model = {
           ? `${collectionPath(g)}?${query}`
           : collectionPath(g);
 
+        logger.info("Listing GitLab {scope} tokens ({filter})", {
+          scope: g.tokenScope,
+          filter: query || "no filter",
+        });
         const tokens = await gitlabListAll<Record<string, unknown>>(g, path);
         logger.info("Discovered {n} {scope} tokens", {
           n: tokens.length,
