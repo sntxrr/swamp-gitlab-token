@@ -132,6 +132,19 @@ const RotateArgsSchema = z.object({
       "GitLab's default, which is one week where an expiry is mandatory and " +
       "the maximum allowable lifetime otherwise.",
   ),
+  when: z.boolean().default(true).describe(
+    "Rotate only when true. Exists because swamp workflows cannot express " +
+      "predicate conditions — step conditions are status-based — so pass a CEL " +
+      "expression here instead, e.g. a daysRemaining threshold.",
+  ),
+});
+
+/** Arguments for revoking an existing token. */
+const RevokeArgsSchema = z.object({
+  when: z.boolean().default(true).describe(
+    "Revoke only when true. Same rationale as the argument of the same name " +
+      "on rotate: swamp workflows cannot express predicate conditions.",
+  ),
 });
 
 /** Arguments for the list factory. */
@@ -665,6 +678,20 @@ export const model = {
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const { globalArgs: g, logger } = context;
         const tokenId = requireTokenId(g, "rotate");
+
+        // Checked before anything else, and before the id is even used against
+        // the API. Rotation is irreversible the instant it lands — GitLab
+        // revokes the current value immediately — so a false predicate must
+        // cost nothing, not merely be undone. No resource is written: the
+        // existing snapshot is still true, and writing a new one would claim a
+        // generation that was never issued.
+        if (!args.when) {
+          logger.info("Condition was false; not rotating token {id}", {
+            id: tokenId,
+          });
+          return { dataHandles: [] };
+        }
+
         logger.info("Rotating GitLab {scope} token {id}", {
           scope: g.tokenScope,
           id: tokenId,
@@ -722,13 +749,23 @@ export const model = {
     delete: {
       description:
         "Revoke the token. Already-revoked is treated as success, not an error.",
-      arguments: z.object({}),
+      arguments: RevokeArgsSchema,
       execute: async (
-        _args: Record<string, never>,
+        args: z.infer<typeof RevokeArgsSchema>,
         context: ExecuteContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const { globalArgs: g, logger } = context;
         const configured = requireTokenId(g, "delete");
+
+        // Skipping is a first-class outcome, not an error. No resource is
+        // written: the existing snapshot is still true, and fabricating a
+        // revoked one would corrupt the inventory this model exists to keep.
+        if (!args.when) {
+          logger.info("Condition was false; not revoking token {id}", {
+            id: configured,
+          });
+          return { dataHandles: [] };
+        }
 
         // `self` is a keyword, not an id. Revoke returns 204 with no body, so
         // unlike sync and rotate this method cannot learn the real id from its

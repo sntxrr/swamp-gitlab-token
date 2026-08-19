@@ -1,0 +1,123 @@
+name: "@sntxrr/gitlab-token-rotation"
+description: >-
+  Keep one GitLab access token ahead of its own expiry: check what it has left
+  every day, and rotate it only when a human has said to and it is actually
+  close to lapsing.
+
+  The default posture is deliberate. `rotate` defaults to FALSE, so the
+  scheduled run is a read-only check that keeps the token's `daysRemaining`
+  current and does nothing else. Rotation is irreversible the instant it lands
+  — GitLab revokes the outgoing value immediately, and replaying it trips reuse
+  detection which revokes the whole token family — so an unattended schedule
+  that could rotate on its own would be a way to take a consumer offline at
+  06:40 with nobody watching. Turn it on deliberately:
+
+      swamp workflow run @sntxrr/gitlab-token-rotation --input rotate=true
+
+  The threshold is a second, independent gate. Even with `rotate=true` the
+  rotate step is skipped unless the token is inside `rotateWithinDays`, so
+  re-running the workflow by hand does not mint a new token every time it is
+  invoked. Both conditions are evaluated in the model's `when` argument rather
+  than a step condition, because swamp step conditions are status-based and
+  cannot express a predicate over another step's output.
+
+  The new value is disclosed exactly once. It lands in the model's `secret`
+  resource, whose field is marked sensitive, so swamp stores it in a vault and
+  persists only a reference. Wire the consumer to it before enabling rotation —
+  a rotation whose output nothing reads is an outage you scheduled.
+
+  Model instance: one per token, as the type intends. Point it at the token to
+  manage with `tokenId`, or the literal `self` to manage the token doing the
+  authenticating.
+tags: {}
+# Daily. The CHECK wants to be frequent — an expiry that is only noticed weekly
+# can already be a week into an outage — while the ROTATION is gated on a
+# threshold, so a daily cadence produces at most one rotation per token per
+# lifetime rather than one per run. Off the hour to avoid colliding with
+# whatever else a host runs at :00.
+trigger:
+  schedule: "40 6 * * *"
+inputs:
+  properties:
+    rotate:
+      type: boolean
+      description: >-
+        Permit rotation. FALSE by default, which makes the scheduled run
+        read-only. Rotation revokes the outgoing token immediately and
+        cannot be undone, so this is opt-in per run.
+      default: false
+    rotateWithinDays:
+      type: integer
+      description: >-
+        Rotate only when the token has this many days or fewer remaining.
+        Independent of `rotate`: both must hold. Keeps a hand-run from
+        minting a fresh token every time it is invoked.
+      default: 7
+    expiresAt:
+      type: string
+      description: >-
+        Expiry for the replacement token, as YYYY-MM-DD. Leave empty to take
+        GitLab's default, which is one week where an expiry is mandatory and
+        the instance maximum otherwise.
+      default: ""
+  required: []
+jobs:
+  - name: check
+    description: Read the managed token's current expiry
+    steps:
+      - name: sync-token
+        description: >-
+          Read-only. Writes a `token` snapshot carrying `daysRemaining`, keyed
+          by the token's real GitLab ID, which the rotate step below reads back
+          through `data.findBySpec`.
+        task:
+          type: model_method
+          modelIdOrName: gitlab-token
+          methodName: sync
+        dependsOn: []
+        weight: 0
+        # NOT allowFailure. If the check cannot run, the token's remaining life
+        # is UNKNOWN rather than known-good, and a rotation decision must never
+        # be taken against a stale snapshot.
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+  - name: rotate
+    description: Rotate, but only when told to and only when close to expiry
+    steps:
+      - name: rotate-token
+        description: >-
+          Gated on BOTH `inputs.rotate` and the days-remaining threshold, in the
+          model's own `when` argument. A false predicate costs nothing: the
+          model returns before it touches the API and writes no resource, so the
+          existing snapshot stays true rather than gaining a generation that was
+          never issued.
+
+          `data.findBySpec` rather than `data.latest`: this model keys each
+          snapshot by the token's real GitLab ID — deliberately, so drift
+          reconciles and a rotated-away generation is not overwritten by its
+          successor — which means the instance name is not known when this file
+          is written. `findBySpec` addresses the spec instead, and `exists`
+          holds when any snapshot from it is inside the threshold. For a
+          one-token instance that is the one snapshot.
+        task:
+          type: model_method
+          modelIdOrName: gitlab-token
+          methodName: rotate
+          inputs:
+            expiresAt: ${{ inputs.expiresAt }}
+            when: >-
+              ${{ inputs.rotate &&
+              data.findBySpec('gitlab-token', 'token').exists(t,
+              t.attributes.daysRemaining <= inputs.rotateWithinDays) }}
+        dependsOn: []
+        weight: 0
+        # NOT allowFailure. A rotation that half-happened is the one outcome
+        # worth failing the run over: the outgoing token may already be revoked,
+        # so silence here would report success over a live outage.
+        allowFailure: false
+    dependsOn:
+      - job: check
+        condition:
+          type: succeeded
+    weight: 1
