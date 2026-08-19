@@ -586,3 +586,68 @@ Deno.test("valid-target passes a well-formed project target", () => {
   });
   assertEquals(result.pass, true);
 });
+
+// --- Mechanical-check regressions -------------------------------------------
+
+Deno.test("list refuses to report a partial inventory as a complete one", async () => {
+  // A never-terminating x-next-page must fail loudly. Returning what was read
+  // would present an under-count as a full audit — the exact failure an
+  // access-token inventory exists to prevent.
+  const { ctx } = makeContext(PROJECT_G);
+  await withMockedFetch(
+    () =>
+      new Response(JSON.stringify([{ id: 1 }]), {
+        status: 200,
+        // Never clears.
+        headers: { "x-next-page": "2" },
+      }),
+    async () => {
+      await assertRejects(
+        () => model.methods.list.execute({ state: "active" }, ctx),
+        Error,
+        "Refusing to report a partial inventory",
+      );
+    },
+  );
+});
+
+Deno.test("delete resolves the self keyword to the real id before revoking", async () => {
+  // Revoke returns 204 with no body, so delete cannot learn the id from its own
+  // response. Keying the snapshot "self" would file one token under two names
+  // and drift reconciliation against sync would never match.
+  const { ctx, writes } = makeContext({ ...G, tokenId: "self" });
+  const calls: Array<{ method: string; url: string }> = [];
+  await withMockedFetch(
+    (url, init) => {
+      calls.push({ method: String(init.method ?? "GET"), url });
+      if ((init.method ?? "GET") === "GET") {
+        return new Response(JSON.stringify({ id: 4242, name: "ci" }), {
+          status: 200,
+        });
+      }
+      return new Response(null, { status: 204 });
+    },
+    () => model.methods.delete.execute({}, ctx),
+  );
+  assertEquals(calls[0].method, "GET");
+  assertStringIncludes(calls[0].url, "/personal_access_tokens/self");
+  assertEquals(calls[1].method, "DELETE");
+  // The DELETE must target the resolved id, not the keyword.
+  assertStringIncludes(calls[1].url, "/personal_access_tokens/4242");
+  assertEquals(writes[0].name, "4242");
+  assertEquals(writes[0].data.id, "4242");
+});
+
+Deno.test("delete by explicit id makes no resolving call", () => {
+  const { ctx } = makeContext(G);
+  const methods: string[] = [];
+  return withMockedFetch(
+    (_url, init) => {
+      methods.push(String(init.method ?? "GET"));
+      return new Response(null, { status: 204 });
+    },
+    () => model.methods.delete.execute({}, ctx),
+  ).then(() => {
+    assertEquals(methods, ["DELETE"]);
+  });
+});
