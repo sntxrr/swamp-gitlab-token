@@ -257,12 +257,24 @@ rotates it only when told to *and* only when it is genuinely close to lapsing,
 and then writes the replacement through to the CI/CD variable that consumes it.
 
 ```bash
-# scheduled path — read-only, keeps daysRemaining current
+# read-only -- keeps daysRemaining current, rotates nothing
 swamp workflow run @sntxrr/gitlab-token-rotation
 
 # rotate, if the token is inside the threshold
 swamp workflow run @sntxrr/gitlab-token-rotation --input rotate=true
+
+# schedule it -- the workflow ships WITHOUT a trigger, on purpose
+swamp workflow trigger set @sntxrr/gitlab-token-rotation --schedule "40 6 * * *"
 ```
+
+**It ships without a schedule.** An extension-shipped workflow carrying its own
+`trigger:` starts running on every host that installs the extension, at a time
+its author picked, against whatever model instance matches the hardcoded name.
+`2026.08.29.1` did that: installing it registered a daily 06:40 job on a host
+that already had its own rotation schedule, and the two ran ten minutes apart
+against the same token. Set the trigger yourself, or wrap the model methods in
+a workflow of your own -- which is also how you add notification, since this one
+deliberately has none.
 
 | Input | Default | Effect |
 | --- | --- | --- |
@@ -292,6 +304,31 @@ including the one just rotated away, sitting at zero days remaining forever. An
 workflow gated on it would rotate again on every subsequent run. `managed` holds
 only the generation in play, so the predicate goes false the moment a fresh
 token is issued.
+
+### Propagation is gated on a fresh secret, not on the threshold
+
+The subtlest thing in this file, and `2026.08.29.1` got it wrong. By the time
+`propagate` runs, `rotate` has **already overwritten `managed`** with the new
+token -- which has a full lifetime ahead of it. So a days-remaining predicate on
+the propagate step is **false exactly when propagation was needed**: the old
+value is revoked, the new one is never published, and the run reports success.
+
+The signal is "did *this run* produce a secret". `rotate` writes the snapshot
+and the secret in one call with a single `observedAt`; a plain `sync` refreshes
+`managed` alone. So:
+
+```
+data.latest('gitlab-token', 'current').?attributes.?observedAt.orValue('')
+  == data.latest('gitlab-token', 'managed').?attributes.?observedAt.orValue('-')
+```
+
+is exactly "a rotation occurred in this run", and false on the first run when
+`current` does not exist.
+
+**Safe-navigate every data reference in a step's inputs.** A step's inputs are
+evaluated even when its `when` is false -- `when` gates execution, not
+evaluation -- so the plain `.attributes.token` form kills the run with
+`No such key: attributes` before any rotation has happened.
 
 **Wire the consumer before enabling rotation.** The replacement value lands in
 the `secret` resource and nowhere else. A rotation whose output nothing reads is

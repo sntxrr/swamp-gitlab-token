@@ -52,13 +52,21 @@ description: >-
   not. `tokenId` remains right for pinning one specific generation, which is not
   what a rotation schedule wants.
 tags: {}
-# Daily. The CHECK wants to be frequent — an expiry that is only noticed weekly
-# can already be a week into an outage — while the ROTATION is gated on a
-# threshold, so a daily cadence produces at most one rotation per token per
-# lifetime rather than one per run. Off the hour to avoid colliding with
-# whatever else a host runs at :00.
-trigger:
-  schedule: "40 6 * * *"
+# NO `trigger:`, deliberately. An extension-shipped workflow that carries its
+# own schedule starts running on every host that installs the extension, at a
+# time its author picked, against whatever model instance happens to match the
+# hardcoded name — before the operator has decided they want it. 2026.08.29.1
+# did exactly that: installing it registered a daily 06:40 job on a host that
+# already had its own rotation schedule, and the two ran ten minutes apart
+# against the same token.
+#
+# The cadence belongs to the operator, and it is not one decision but two: the
+# CHECK wants to be frequent (an expiry noticed weekly can already be a week
+# into an outage) while the ROTATION is gated on the threshold below, so daily
+# yields at most one rotation per token lifetime. Schedule it with a trigger
+# override, or wrap it in a workflow of your own:
+#
+#     swamp workflow trigger set @sntxrr/gitlab-token-rotation --schedule "40 6 * * *"
 inputs:
   properties:
     rotate:
@@ -187,11 +195,34 @@ jobs:
           picking wrong would write a REVOKED value over a live one. `current`
           is always the value issued most recently.
 
-          Gated on the same two conditions as the rotate step plus a configured
-          target, so a run that rotated nothing writes nothing. The model
-          re-asserts `masked` and `protected` on every write, because GitLab
-          does not inherit them and silently unmasking a secret in a public
-          project's job log is the worse failure of the two.
+          THE PREDICATE IS NOT THE ROTATE PREDICATE, and 2026.08.29.1 got this
+          wrong. By the time this step runs, `rotate` has already overwritten
+          `managed` with the NEW token, which has a full lifetime ahead of it —
+          so a days-remaining threshold is FALSE precisely when propagation was
+          needed. The old value would be revoked and the new one never
+          published, and the run would report success.
+
+          The correct signal is "did THIS run produce a secret". `rotate` writes
+          the metadata snapshot and the secret in one call with a single
+          `observedAt`, so the two stamps match only when a rotation just
+          happened; a plain `sync` refreshes `managed` alone and leaves
+          `current` behind at its older stamp. The equality is therefore exactly
+          "a rotation occurred in this run", and it is false on the very first
+          run, when `current` does not exist at all.
+
+          Every reference below is safe-navigated because a step's inputs are
+          EVALUATED even when its `when` is false — `when` gates execution, not
+          evaluation. The plain form `.attributes.token` kills the run with
+          "No such key: attributes" before any rotation has ever happened, which
+          is what 2026.08.29.1 did on its first run. The placeholder contains
+          SPACES, which GitLab's masking rules forbid, so a masked write of it
+          is refused with a 400 rather than landing a junk value in a live
+          variable. It is already unreachable; a credential write deserves both
+          unreachable and harmless-if-reached.
+
+          The model re-asserts `masked` and `protected` on every write, because
+          GitLab does not inherit them and silently unmasking a secret in a
+          public project's job log is the worse failure of the two.
         task:
           type: model_method
           modelIdOrName: gitlab-token
@@ -200,14 +231,17 @@ jobs:
             project: ${{ inputs.ciVariableProject }}
             key: ${{ inputs.ciVariableKey }}
             value: >-
-              ${{ data.latest('gitlab-token', 'current').attributes.token }}
+              ${{ data.latest('gitlab-token', 'current').?attributes.?token
+              .orValue('PLACEHOLDER no rotation in this run') }}
             tokenId: >-
-              ${{ data.latest('gitlab-token', 'current').attributes.tokenId }}
+              ${{ data.latest('gitlab-token', 'current').?attributes.?tokenId
+              .orValue('') }}
             when: >-
               ${{ inputs.rotate && inputs.ciVariableKey != '' &&
               inputs.ciVariableProject != '' &&
-              data.latest('gitlab-token', 'managed').?attributes.?daysRemaining.orValue(99999)
-              <= inputs.rotateWithinDays }}
+              data.latest('gitlab-token', 'current').?attributes.?observedAt.orValue('')
+              ==
+              data.latest('gitlab-token', 'managed').?attributes.?observedAt.orValue('-') }}
         dependsOn: []
         weight: 0
         # NOT allowFailure, and this is the most important allowFailure decision

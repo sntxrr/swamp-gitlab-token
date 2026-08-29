@@ -1175,3 +1175,57 @@ Deno.test("propagate job runs only after a succeeded rotate", async () => {
   assertEquals(steps.length, 1);
   assertEquals(steps[0].allowFailure, false);
 });
+
+
+// 2026.08.29.1 shipped a `trigger:` in this file, so installing the extension
+// registered a daily job on every host — at a time this author picked, against
+// whatever instance matched the hardcoded name. On a host that already had its
+// own rotation schedule, the two ran ten minutes apart against the same token.
+// The cadence is the operator's decision; the extension only supplies the DAG.
+Deno.test("shipped workflow carries no schedule of its own", async () => {
+  const doc = parse(
+    await Deno.readTextFile(
+      new URL(
+        "../workflows/workflow-gitlab-token-rotation.yaml",
+        import.meta.url,
+      ),
+    ),
+  ) as Record<string, unknown>;
+  assertEquals(doc.trigger, undefined);
+});
+
+// The propagate step must NOT reuse the rotate threshold. By the time it runs,
+// rotate has overwritten `managed` with the new token, whose days-remaining is
+// a full lifetime — so a threshold predicate is false exactly when propagation
+// was needed, revoking the old value and never publishing the new one, and
+// reporting success. The signal has to be "did this run produce a secret",
+// which is the two observedAt stamps matching.
+Deno.test("propagate gates on a fresh secret, not on the expiry threshold", async () => {
+  const doc = parse(
+    await Deno.readTextFile(
+      new URL(
+        "../workflows/workflow-gitlab-token-rotation.yaml",
+        import.meta.url,
+      ),
+    ),
+  ) as { jobs: Array<Record<string, unknown>> };
+  const job = doc.jobs.find((j) => j.name === "propagate")!;
+  const step = (job.steps as Array<Record<string, unknown>>)[0];
+  const inputs = (step.task as Record<string, unknown>).inputs as Record<
+    string,
+    string
+  >;
+
+  assertStringIncludes(inputs.when, "observedAt");
+  assert(
+    !inputs.when.includes("daysRemaining"),
+    "propagate must not gate on daysRemaining — see the comment above",
+  );
+
+  // Inputs are evaluated even when `when` is false, so every data reference
+  // here must survive `current` not existing yet.
+  for (const key of ["value", "tokenId"]) {
+    assertStringIncludes(inputs[key], "?attributes");
+    assertStringIncludes(inputs[key], "orValue");
+  }
+});

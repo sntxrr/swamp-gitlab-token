@@ -203,11 +203,13 @@ const UpdateCiVariableArgsSchema = z.object({
   ),
   value: z.string().min(1).meta({ sensitive: true }).describe(
     "The value to write. SENSITIVE: vaulted by swamp, masked in logs. Wire it " +
-      "from the rotation output via the stable alias, e.g. " +
-      "${{ data.latest('gitlab-token', 'current').attributes.token }}. NOT " +
-      "findBySpec over the secret spec: that returns every generation with no " +
-      "way to ask for the newest, so it can write a REVOKED value over a live " +
-      "one.",
+      "from the rotation output via the stable alias, and SAFE-NAVIGATE it: " +
+      "a step's inputs are evaluated even when its `when` is false, so the " +
+      "plain form kills the run before the first rotation exists. Write " +
+      "${{ data.latest('gitlab-token', 'current').?attributes.?token" +
+      ".orValue('...') }}. NOT findBySpec over the secret spec: that returns " +
+      "every generation with no way to ask for the newest, so it can write a " +
+      "REVOKED value over a live one.",
   ),
   masked: z.boolean().default(true).describe(
     "Mask the value in job logs. Defaults true and should stay true: GitLab " +
@@ -708,15 +710,21 @@ export const model = {
   type: "@sntxrr/gitlab-token",
   description:
     "Create, rotate, revoke and inventory GitLab personal, project and group access tokens",
-  version: "2026.08.29.1",
-  // No-op by design, and deliberately so even though globalArguments did grow.
+  version: "2026.08.29.2",
+  // Both entries are no-ops, and each has to exist anyway: without one, an
+  // instance stays pinned to its old typeVersion and never sees the release.
   //
-  // This release adds `update-ci-variable`, the `ci-variable` resource, the
-  // `current` secret alias, the `managed` metadata alias, and the optional
-  // `tokenName` argument. Only the last touches globalArguments, and it is
-  // optional with no default — there is nothing to backfill, and synthesising
-  // a name for an instance configured by id would be a guess at which token
-  // the author meant.
+  // 2026.08.29.1 added `update-ci-variable`, the `ci-variable` resource, the
+  // `current` and `managed` aliases, and the optional `tokenName` argument.
+  // Only the last touches globalArguments, and it is optional with no default —
+  // nothing to backfill, and synthesising a name for an instance configured by
+  // id would be a guess at which token the author meant.
+  //
+  // 2026.08.29.2 changes no model code at all: it drops the workflow's built-in
+  // schedule and fixes its propagate step. Instances carry no state that a
+  // workflow edit could invalidate, so there is genuinely nothing to migrate —
+  // but an operator who VENDORED a copy of the workflow has the old, broken one
+  // and no upgrade can reach it. That is what the description says.
   //
   // Existing instances therefore keep working exactly as before, on `tokenId`,
   // including its rotation weakness. Moving to `tokenName` is a deliberate
@@ -730,6 +738,12 @@ export const model = {
       toVersion: "2026.08.29.1",
       description:
         "Add update-ci-variable, the ci-variable resource, the `current` and `managed` aliases, and the optional tokenName argument. No existing globalArguments change meaning.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.29.2",
+      description:
+        "Workflow only: drop the built-in schedule, fix the propagate predicate, safe-navigate its inputs. No model change, so nothing to migrate — but re-read the workflow if you vendored a copy.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
