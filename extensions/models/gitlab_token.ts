@@ -45,6 +45,15 @@
  *    family. The metadata snapshot is therefore keyed by the *new* id, so the
  *    dead generation is not silently overwritten by its successor.
  *
+ *    Which is why an id is the wrong thing to configure. `globalArgs.tokenId`
+ *    names one generation and stops being true the first time that generation
+ *    rotates; every run afterwards authenticates fine and then operates on a
+ *    revoked token. Set `globalArgs.tokenName` instead and the id is resolved
+ *    fresh each run, because rotation carries the name forward. The metadata is
+ *    also written under the alias `managed` — distinct from the secret's
+ *    `current` — so a threshold predicate reads only the generation in play
+ *    rather than every generation that ever existed.
+ *
  * 4. **Revocation is idempotent.** A `delete` against an already-revoked token
  *    is success, not an error — the desired state is "gone", and a cleanup job
  *    that fails on its second run is a cleanup job nobody schedules.
@@ -108,7 +117,16 @@ const GlobalArgsSchema = z.object({
   tokenId: z.string().optional().describe(
     "ID of the token this model manages. Also accepts the literal `self` to " +
       "act on the token doing the authenticating. Optional — `create` learns " +
-      "the ID from the API; every other single-token method requires it.",
+      "the ID from the API; every other single-token method requires either " +
+      "this or tokenName. NOT rotation-stable: see tokenName.",
+  ),
+  tokenName: z.string().optional().describe(
+    "Name of the token this model manages, resolved to its live ID on every " +
+      "run. Prefer this over tokenId for anything that rotates. Rotation mints " +
+      "a NEW id and revokes the old one, so a configured tokenId names the " +
+      "revoked predecessor from the second rotation onward and every later run " +
+      "fails against a dead token. The name survives rotation; the id does " +
+      "not. Set one or the other, never both.",
   ),
   userId: z.string().optional().describe(
     "User ID to create a personal access token for. Requires instance " +
@@ -440,6 +458,41 @@ type ExecuteContext = {
   ) => Promise<{ name: string }>;
 };
 
+/**
+ * Stable alias for the token this instance manages, alongside the id-keyed
+ * snapshot.
+ *
+ * Deliberately NOT `current`, which already names the newest `secret`. Two
+ * specs sharing one instance name would make `data.latest(model, "current")`
+ * ambiguous between metadata and a secret, and the failure would be a silent
+ * wrong-field read rather than an error.
+ */
+const MANAGED_ALIAS = "managed";
+
+/**
+ * Write a token snapshot twice: keyed by its real GitLab id, and under
+ * {@link MANAGED_ALIAS}.
+ *
+ * The id-keyed copy is the audit trail and must never be overwritten by a
+ * successor. But it is also why a threshold predicate cannot be written against
+ * this spec: `findBySpec` returns every generation, so an `exists` over
+ * `daysRemaining` stays true forever once one token has come close to expiry —
+ * the retired generation is still sitting there at zero days. A workflow gated
+ * that way would rotate on every run after the first, burning a token family.
+ *
+ * `managed` always holds the generation this instance currently manages, so a
+ * predicate over it goes false the moment a fresh token is issued.
+ */
+async function writeTokenSnapshot(
+  context: ExecuteContext,
+  resource: Record<string, unknown>,
+): Promise<Array<{ name: string }>> {
+  return [
+    await context.writeResource("token", String(resource.id), resource),
+    await context.writeResource("token", MANAGED_ALIAS, resource),
+  ];
+}
+
 // --- Paths -----------------------------------------------------------------
 /**
  * Build the collection path for the configured token family.
@@ -490,12 +543,78 @@ function requireNamespace(g: GlobalArgs): string {
 function requireTokenId(g: GlobalArgs, method: string): string {
   if (!g.tokenId) {
     throw new Error(
-      `The "${method}" method requires globalArgs.tokenId — the ID of an ` +
-        `existing token, or the literal "self". Set tokenId on the model, or ` +
-        `run "create" first to provision one.`,
+      `The "${method}" method requires globalArgs.tokenId or ` +
+        `globalArgs.tokenName — the ID of an existing token, the literal ` +
+        `"self", or the name to resolve. Set one on the model, or run ` +
+        `"create" first to provision one.`,
     );
   }
   return g.tokenId;
+}
+
+/**
+ * Resolve the token this instance manages to a live GitLab ID.
+ *
+ * `tokenId` is exact and cheap but NOT rotation-stable: GitLab's rotate revokes
+ * the current token and issues its replacement under a new id, so a configured
+ * id names the revoked predecessor from the second rotation onward. Every run
+ * after that authenticates fine and then operates on a dead token — the model
+ * would be managing a corpse and reporting success at it.
+ *
+ * `tokenName` is the stable handle, because rotation carries the name forward.
+ * It costs one extra listing call and is resolved fresh on every run.
+ */
+async function resolveTokenId(
+  g: GlobalArgs,
+  method: string,
+  logger: Logger,
+): Promise<string> {
+  if (g.tokenId && g.tokenName) {
+    throw new Error(
+      `Both globalArgs.tokenId ("${g.tokenId}") and globalArgs.tokenName ` +
+        `("${g.tokenName}") are set, and they can disagree the moment this ` +
+        `token rotates. Set exactly one: tokenName for anything that rotates, ` +
+        `tokenId to pin one specific generation.`,
+    );
+  }
+  // `self` is a GitLab keyword rather than an id, and it is already stable
+  // across rotations — it always means whoever is authenticating.
+  if (g.tokenId) return g.tokenId;
+  if (!g.tokenName) return requireTokenId(g, method);
+
+  const params = new URLSearchParams({ state: "active", search: g.tokenName });
+  const found = await gitlabListAll<Record<string, unknown>>(
+    g,
+    `${collectionPath(g)}?${params.toString()}`,
+  );
+  // GitLab's `search` is a SUBSTRING match, so "deploy" also returns
+  // "deploy-staging". Narrow to an exact name, or a rotation could be aimed at
+  // a neighbouring token whose name merely contains this one.
+  const exact = found.filter((t) =>
+    t.name === g.tokenName && t.revoked !== true
+  );
+  if (exact.length === 0) {
+    throw new Error(
+      `No active token named "${g.tokenName}" was found in the configured ` +
+        `${g.tokenScope} scope. It may have been revoked or renamed — a ` +
+        `rename breaks this lookup, because the name IS the identifier here. ` +
+        `Check the name, or pin a generation with tokenId instead.`,
+    );
+  }
+  if (exact.length > 1) {
+    throw new Error(
+      `${exact.length} active tokens are named "${g.tokenName}" (ids ` +
+        `${exact.map((t) => t.id).join(", ")}). Refusing to guess which one ` +
+        `"${method}" meant: rotating or revoking the wrong one is not ` +
+        `recoverable. Rename them apart, or pin one with tokenId.`,
+    );
+  }
+  const id = String(exact[0].id);
+  logger.info("Resolved token name {name} to live id {id}", {
+    name: g.tokenName,
+    id,
+  });
+  return id;
 }
 
 // --- Mapping ---------------------------------------------------------------
@@ -587,16 +706,27 @@ export const model = {
   description:
     "Create, rotate, revoke and inventory GitLab personal, project and group access tokens",
   version: "2026.08.29.1",
-  // No-op by design. This release adds a method (`update-ci-variable`), a
-  // resource spec (`ci-variable`) and the `current` secret alias — none of
-  // which touch globalArguments, so there is nothing on an existing instance
-  // to transform. The entry still has to exist: without it, instances stay
-  // pinned to their old typeVersion and never see the new method.
+  // No-op by design, and deliberately so even though globalArguments did grow.
+  //
+  // This release adds `update-ci-variable`, the `ci-variable` resource, the
+  // `current` secret alias, the `managed` metadata alias, and the optional
+  // `tokenName` argument. Only the last touches globalArguments, and it is
+  // optional with no default — there is nothing to backfill, and synthesising
+  // a name for an instance configured by id would be a guess at which token
+  // the author meant.
+  //
+  // Existing instances therefore keep working exactly as before, on `tokenId`,
+  // including its rotation weakness. Moving to `tokenName` is a deliberate
+  // edit, not something an upgrade should do behind an operator's back: it
+  // changes which token a rotation would act on.
+  //
+  // The entry still has to exist. Without it instances stay pinned to their old
+  // typeVersion and never see the new method at all.
   upgrades: [
     {
       toVersion: "2026.08.29.1",
       description:
-        "Add update-ci-variable, the ci-variable resource, and the `current` secret alias. No globalArguments change.",
+        "Add update-ci-variable, the ci-variable resource, the `current` and `managed` aliases, and the optional tokenName argument. No existing globalArguments change meaning.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -640,6 +770,15 @@ export const model = {
               `group path (e.g. "group/repo") that owns the token.`,
           );
         }
+        if (g.tokenId && g.tokenName) {
+          errors.push(
+            `both tokenId ("${g.tokenId}") and tokenName ("${g.tokenName}") ` +
+              `are set. They can disagree the moment this token rotates, and ` +
+              `acting on the wrong generation is not recoverable. Set exactly ` +
+              `one: tokenName for anything that rotates, tokenId to pin one ` +
+              `generation.`,
+          );
+        }
         if (g.tokenScope === "personal" && g.namespace) {
           errors.push(
             `namespace is set but tokenScope is "personal"; a personal access ` +
@@ -672,7 +811,7 @@ export const model = {
         context: ExecuteContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const { globalArgs: g, logger } = context;
-        const tokenId = requireTokenId(g, "sync");
+        const tokenId = await resolveTokenId(g, "sync", logger);
         logger.info("Syncing GitLab {scope} token {id}", {
           scope: g.tokenScope,
           id: tokenId,
@@ -684,16 +823,12 @@ export const model = {
         );
         const now = new Date();
         const resource = toTokenResource(data, g, now.toISOString(), now);
-        const handle = await context.writeResource(
-          "token",
-          String(resource.id),
-          resource,
-        );
+        const handles = await writeTokenSnapshot(context, resource);
         logger.info("Synced GitLab token {id} ({days} days remaining)", {
           id: resource.id,
           days: resource.daysRemaining ?? "no expiry",
         });
-        return { dataHandles: [handle] };
+        return { dataHandles: handles };
       },
     },
     create: {
@@ -755,9 +890,7 @@ export const model = {
         const observedAt = now.toISOString();
         const resource = toTokenResource(data, g, observedAt, now);
         const newId = String(resource.id);
-        const handles = [
-          await context.writeResource("token", newId, resource),
-        ];
+        const handles = await writeTokenSnapshot(context, resource);
 
         // Absent only if GitLab changes its contract; writing an empty secret
         // would be worse than saying nothing, so the resource is skipped.
@@ -815,7 +948,7 @@ export const model = {
         context: ExecuteContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const { globalArgs: g, logger } = context;
-        const tokenId = requireTokenId(g, "rotate");
+        const tokenId = await resolveTokenId(g, "rotate", logger);
 
         // Checked before anything else, and before the id is even used against
         // the API. Rotation is irreversible the instant it lands — GitLab
@@ -850,9 +983,7 @@ export const model = {
         // distinct, now-revoked token; overwriting its snapshot would erase the
         // record of what was just retired.
         const newId = String(resource.id);
-        const handles = [
-          await context.writeResource("token", newId, resource),
-        ];
+        const handles = await writeTokenSnapshot(context, resource);
 
         const value = data.token as string | undefined;
         if (value) {
@@ -1057,7 +1188,7 @@ export const model = {
         context: ExecuteContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const { globalArgs: g, logger } = context;
-        const configured = requireTokenId(g, "delete");
+        const configured = await resolveTokenId(g, "delete", logger);
 
         // Skipping is a first-class outcome, not an error. No resource is
         // written: the existing snapshot is still true, and fabricating a
@@ -1110,9 +1241,11 @@ export const model = {
         // GitLab's revoke returns 204 with no body, so the post-state is
         // asserted rather than read back: the token is revoked and inactive by
         // definition of the call having succeeded.
-        const handle = await context.writeResource(
-          "token",
-          tokenId,
+        // `managed` is updated too, so it does not go on claiming an active
+        // token this method just killed. A revoked `managed` is the honest
+        // post-state; a stale one would read as healthy.
+        const handles = await writeTokenSnapshot(
+          context,
           toTokenResource(
             { id: tokenId, revoked: true, active: false },
             g,
@@ -1124,7 +1257,7 @@ export const model = {
           id: tokenId,
           absent,
         });
-        return { dataHandles: [handle] };
+        return { dataHandles: handles };
       },
     },
     list: {
@@ -1182,4 +1315,6 @@ export const _internal = {
   gitlabListAll,
   requireNamespace,
   requireTokenId,
+  resolveTokenId,
+  MANAGED_ALIAS,
 };

@@ -26,9 +26,17 @@ description: >-
   persists only a reference. Wire the consumer to it before enabling rotation —
   a rotation whose output nothing reads is an outage you scheduled.
 
-  Model instance: one per token, as the type intends. Point it at the token to
-  manage with `tokenId`, or the literal `self` to manage the token doing the
+  Model instance: one per token, as the type intends. Point it at the token with
+  `tokenName`, or the literal `self` in `tokenId` to manage the token doing the
   authenticating.
+
+  Use `tokenName`, not `tokenId`, for anything this workflow will actually
+  rotate. GitLab's rotate revokes the outgoing token and issues its replacement
+  under a NEW id, so a configured `tokenId` names the revoked predecessor from
+  the second run onward — the schedule would authenticate fine and then operate
+  on a dead token every day thereafter. The name survives rotation; the id does
+  not. `tokenId` remains right for pinning one specific generation, which is not
+  what a rotation schedule wants.
 tags: {}
 # Daily. The CHECK wants to be frequent — an expiry that is only noticed weekly
 # can already be a week into an outage — while the ROTATION is gated on a
@@ -82,9 +90,14 @@ jobs:
     steps:
       - name: sync-token
         description: >-
-          Read-only. Writes a `token` snapshot carrying `daysRemaining`, keyed
-          by the token's real GitLab ID, which the rotate step below reads back
-          through `data.findBySpec`.
+          Read-only. Writes a `token` snapshot carrying `daysRemaining` twice:
+          keyed by the token's real GitLab ID for the audit trail, and under the
+          stable alias `managed`, which the rotate step below reads back.
+
+          This is also where `tokenName` earns its keep. If the instance is
+          configured by name rather than by ID, this step resolves it to the
+          live ID first — so the run after a rotation addresses the NEW token
+          rather than the revoked one it replaced.
         task:
           type: model_method
           modelIdOrName: gitlab-token
@@ -108,13 +121,20 @@ jobs:
           existing snapshot stays true rather than gaining a generation that was
           never issued.
 
-          `data.findBySpec` rather than `data.latest`: this model keys each
-          snapshot by the token's real GitLab ID — deliberately, so drift
-          reconciles and a rotated-away generation is not overwritten by its
-          successor — which means the instance name is not known when this file
-          is written. `findBySpec` addresses the spec instead, and `exists`
-          holds when any snapshot from it is inside the threshold. For a
-          one-token instance that is the one snapshot.
+          The threshold reads the `managed` alias, NOT `findBySpec`. This model
+          keys each snapshot by the token's real GitLab ID so a retired
+          generation is never overwritten, which means `findBySpec` returns
+          EVERY generation — including the one that was just rotated away, still
+          sitting at zero days remaining. An `exists` over that stays true
+          forever once any token has neared expiry, so a workflow gated on it
+          would rotate again on every subsequent run and burn the token family.
+          `managed` holds only the generation in play, so the predicate goes
+          false as soon as a fresh token is issued.
+
+          `.orValue` covers two honest gaps: a token with no expiry reports a
+          null `daysRemaining`, and before the first sync there is no snapshot
+          at all. Both default to a number far outside any threshold, so the
+          absence of evidence never reads as due-for-rotation.
         task:
           type: model_method
           modelIdOrName: gitlab-token
@@ -123,8 +143,8 @@ jobs:
             expiresAt: ${{ inputs.expiresAt }}
             when: >-
               ${{ inputs.rotate &&
-              data.findBySpec('gitlab-token', 'token').exists(t,
-              t.attributes.daysRemaining <= inputs.rotateWithinDays) }}
+              data.latest('gitlab-token', 'managed').?attributes.?daysRemaining.orValue(99999)
+              <= inputs.rotateWithinDays }}
         dependsOn: []
         weight: 0
         # NOT allowFailure. A rotation that half-happened is the one outcome
@@ -172,8 +192,8 @@ jobs:
             when: >-
               ${{ inputs.rotate && inputs.ciVariableKey != '' &&
               inputs.ciVariableProject != '' &&
-              data.findBySpec('gitlab-token', 'token').exists(t,
-              t.attributes.daysRemaining <= inputs.rotateWithinDays) }}
+              data.latest('gitlab-token', 'managed').?attributes.?daysRemaining.orValue(99999)
+              <= inputs.rotateWithinDays }}
         dependsOn: []
         weight: 0
         # NOT allowFailure, and this is the most important allowFailure decision

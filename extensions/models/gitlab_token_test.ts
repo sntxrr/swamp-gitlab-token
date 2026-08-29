@@ -229,9 +229,11 @@ Deno.test("sync GETs the token with the PRIVATE-TOKEN header", async () => {
     (call.init.headers as Record<string, string>)["PRIVATE-TOKEN"],
     "glpat-test-value",
   );
-  assertEquals(writes.length, 1);
+  // id-keyed snapshot plus the `managed` alias.
+  assertEquals(writes.length, 2);
   assertEquals(writes[0].spec, "token");
   assertEquals(writes[0].name, "42");
+  assertEquals(writes[1].name, "managed");
 });
 
 Deno.test("sync without a tokenId fails with an actionable message", async () => {
@@ -280,8 +282,8 @@ Deno.test("create posts scopes and access_level, and vaults the value separately
   assertEquals(body.access_level, 40);
   assertEquals(body.expires_at, "2026-09-18");
 
-  // token metadata, the id-keyed secret, and the `current` alias.
-  assertEquals(writes.length, 3);
+  // token id-keyed + `managed`, secret id-keyed + `current`.
+  assertEquals(writes.length, 4);
   const meta = writes.find((w) => w.spec === "token")!;
   const secret = writes.find((w) => w.spec === "secret")!;
   assertEquals(meta.name, "77");
@@ -451,7 +453,7 @@ Deno.test("delete treats an already-revoked token as success", async () => {
     () => new Response('{"message":"404 Not found"}', { status: 404 }),
     () => model.methods.delete.execute({ when: true }, ctx),
   );
-  assertEquals(writes.length, 1);
+  assertEquals(writes.length, 2);
   assertEquals(writes[0].data.revoked, true);
 });
 
@@ -535,7 +537,7 @@ Deno.test("a 429 is retried and then succeeds", async () => {
     () => model.methods.sync.execute({}, ctx),
   );
   assertEquals(attempts, 2);
-  assertEquals(writes.length, 1);
+  assertEquals(writes.length, 2);
 });
 
 Deno.test("the API path is appended to the configured base URL", async () => {
@@ -938,4 +940,188 @@ Deno.test("update-ci-variable rejects an empty value before calling the API", as
     value: "",
   });
   assert(!parsed.success, "an empty value must not be accepted");
+});
+
+// --- rotation-stable identity ----------------------------------------------
+const NAMED_G = {
+  token: "glpat-test-value",
+  baseUrl: "https://gitlab.example.com",
+  tokenScope: "personal" as const,
+  tokenName: "sm-deploy",
+  timeoutMs: 15000,
+};
+
+/** Route the resolving list call and the follow-up read separately. */
+function routed(list: unknown[], detail: Record<string, unknown>) {
+  return (u: string) =>
+    u.includes("search=")
+      ? new Response(JSON.stringify(list), { status: 200 })
+      : new Response(JSON.stringify(detail), { status: 200 });
+}
+
+Deno.test("tokenName resolves to the live id, which is what survives a rotation", async () => {
+  const { ctx, writes } = makeContext(NAMED_G);
+  await withMockedFetch(
+    routed(
+      [{ id: 5150, name: "sm-deploy", revoked: false }],
+      { id: 5150, name: "sm-deploy", expires_at: "2026-12-01" },
+    ),
+    () => model.methods.sync.execute({}, ctx),
+  );
+  assertEquals(writes.find((w) => w.name === "5150")!.data.id, "5150");
+});
+
+Deno.test("tokenName ignores a substring match on a neighbouring token", async () => {
+  // GitLab's `search` is a substring match, so "sm-deploy" also returns
+  // "sm-deploy-staging". Rotating the neighbour would be unrecoverable.
+  const { ctx, writes } = makeContext(NAMED_G);
+  await withMockedFetch(
+    routed(
+      [
+        { id: 111, name: "sm-deploy-staging", revoked: false },
+        { id: 5150, name: "sm-deploy", revoked: false },
+      ],
+      { id: 5150, name: "sm-deploy" },
+    ),
+    () => model.methods.sync.execute({}, ctx),
+  );
+  assert(
+    writes.some((w) => w.name === "5150"),
+    "must resolve the exact name, not the substring neighbour",
+  );
+});
+
+Deno.test("tokenName skips a revoked generation of the same name", async () => {
+  const { ctx, writes } = makeContext(NAMED_G);
+  await withMockedFetch(
+    routed(
+      [
+        { id: 1, name: "sm-deploy", revoked: true },
+        { id: 2, name: "sm-deploy", revoked: false },
+      ],
+      { id: 2, name: "sm-deploy" },
+    ),
+    () => model.methods.sync.execute({}, ctx),
+  );
+  assert(writes.some((w) => w.name === "2"), "must pick the live generation");
+});
+
+Deno.test("tokenName refuses to guess between duplicates", async () => {
+  const { ctx } = makeContext(NAMED_G);
+  const err = await assertRejects(
+    () =>
+      withMockedFetch(
+        routed(
+          [
+            { id: 1, name: "sm-deploy", revoked: false },
+            { id: 2, name: "sm-deploy", revoked: false },
+          ],
+          {},
+        ),
+        () => model.methods.sync.execute({}, ctx),
+      ),
+    Error,
+  );
+  assertStringIncludes(err.message, "2 active tokens");
+  assertStringIncludes(err.message, "1, 2");
+});
+
+Deno.test("tokenName with no live match says so rather than 404ing later", async () => {
+  const { ctx } = makeContext(NAMED_G);
+  const err = await assertRejects(
+    () =>
+      withMockedFetch(
+        routed([], {}),
+        () => model.methods.sync.execute({}, ctx),
+      ),
+    Error,
+  );
+  assertStringIncludes(err.message, 'No active token named "sm-deploy"');
+});
+
+Deno.test("tokenId and tokenName together is a configuration error", async () => {
+  // They can disagree the moment the token rotates, and silently picking one
+  // would mean rotating whichever the author did not mean.
+  const { ctx } = makeContext({ ...NAMED_G, tokenId: "42" });
+  const err = await assertRejects(
+    () =>
+      withMockedFetch(
+        () => new Response("{}", { status: 200 }),
+        () => model.methods.sync.execute({}, ctx),
+      ),
+    Error,
+  );
+  assertStringIncludes(err.message, "Set exactly one");
+});
+
+Deno.test("an explicit tokenId still spends no resolving call", async () => {
+  const { ctx } = makeContext(G);
+  const urls: string[] = [];
+  await withMockedFetch(
+    (u) => {
+      urls.push(u);
+      return new Response(JSON.stringify({ id: 42 }), { status: 200 });
+    },
+    () => model.methods.sync.execute({}, ctx),
+  );
+  assertEquals(urls.length, 1);
+  assert(!urls[0].includes("search="), "a pinned id must not be resolved");
+});
+
+Deno.test("the managed alias tracks the generation in play, so a threshold goes false", async () => {
+  // The bug this closes: findBySpec returns EVERY generation, so an exists()
+  // over daysRemaining stays true forever once one token neared expiry — the
+  // retired one sits at zero days and would re-trigger rotation every run.
+  const { ctx, writes } = makeContext(G);
+  await withMockedFetch(
+    () =>
+      new Response(
+        JSON.stringify({ id: 99, name: "d", token: "glpat-x", expires_at: "2027-01-01" }),
+        { status: 200 },
+      ),
+    () => model.methods.rotate.execute({ when: true }, ctx),
+  );
+  const managed = writes.find((w) => w.spec === "token" && w.name === "managed")!;
+  assertEquals(managed.data.id, "99");
+});
+
+Deno.test("the two aliases never share an instance name", async () => {
+  // A shared name across specs would make data.latest(model, name) ambiguous
+  // between metadata and a secret, and the failure would be a silent
+  // wrong-field read rather than an error. Assert against what rotate actually
+  // writes, not against the constants.
+  const { ctx, writes } = makeContext(G);
+  await withMockedFetch(
+    () =>
+      new Response(JSON.stringify({ id: 99, token: "glpat-x" }), { status: 200 }),
+    () => model.methods.rotate.execute({ when: true }, ctx),
+  );
+  const aliases = writes.filter((w) => !/^[0-9]+$/.test(w.name));
+  const names = new Set(aliases.map((w) => `${w.spec}:${w.name}`));
+  assertEquals(names.size, aliases.length, "alias names must be unique per spec");
+  const bare = aliases.map((w) => w.name);
+  assertEquals(new Set(bare).size, bare.length, "no two specs may share an alias name");
+});
+
+Deno.test("delete updates managed rather than leaving it claiming a live token", async () => {
+  const { ctx, writes } = makeContext(G);
+  await withMockedFetch(
+    () => new Response(null, { status: 204 }),
+    () => model.methods.delete.execute({ when: true }, ctx),
+  );
+  const managed = writes.find((w) => w.name === "managed")!;
+  assertEquals(managed.data.revoked, true);
+  assertEquals(managed.data.active, false);
+});
+
+Deno.test("valid-target rejects tokenId and tokenName set together", () => {
+  const r = model.checks["valid-target"].execute({
+    globalArgs: {
+      ...G,
+      tokenName: "sm-deploy",
+      baseUrl: "https://gitlab.example.com",
+    },
+  });
+  assert(!r.pass);
+  assertStringIncludes(r.errors!.join(" "), "Set exactly");
 });
