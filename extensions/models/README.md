@@ -257,12 +257,77 @@ rotates it only when told to *and* only when it is genuinely close to lapsing,
 and then writes the replacement through to the CI/CD variable that consumes it.
 
 ```bash
-# scheduled path — read-only, keeps daysRemaining current
+# read-only — refreshes daysRemaining, rotates nothing
 swamp workflow run @sntxrr/gitlab-token-rotation
 
-# rotate, if the token is inside the threshold
-swamp workflow run @sntxrr/gitlab-token-rotation --input rotate=true
+# rotate, if the token is inside the threshold, and hand the new value over
+swamp workflow run @sntxrr/gitlab-token-rotation \
+  --input rotate=true \
+  --input ciVariableProject=group/repo \
+  --input ciVariableKey=GITLAB_PUSH_TOKEN
 ```
+
+### Scheduling it
+
+**The workflow ships without a `trigger:`, on purpose.** An extension-shipped
+workflow that carries its own schedule starts running on every host that
+installs the extension — at a time its author picked, against whatever model
+instance matches the hardcoded name `gitlab-token`. `2026.08.29.1` did exactly
+that: installing it registered a daily 06:40 job on a host that already had its
+own rotation schedule, and the two ran ten minutes apart against the same
+production token. The cadence is yours to choose.
+
+```bash
+# the whole thing: check daily, rotate inside the threshold, propagate
+swamp workflow trigger set @sntxrr/gitlab-token-rotation \
+  --schedule "40 6 * * *" \
+  --input rotate=true \
+  --input rotateWithinDays=14 \
+  --input ciVariableProject=group/repo \
+  --input ciVariableKey=GITLAB_PUSH_TOKEN
+
+# confirm it registered — an override that did not take is silent
+swamp workflow trigger get @sntxrr/gitlab-token-rotation
+
+# undo — `trigger get` then reports "schedule: (none)"
+swamp workflow trigger remove @sntxrr/gitlab-token-rotation
+```
+
+Overrides live in `.swamp/serve.yaml`, so they are per-install and survive an
+extension upgrade. One CLI wrinkle worth knowing if you go on to debug your own
+expressions: `swamp workflow run --input rotateWithinDays=14` coerces that
+string against the declared type, but `swamp workflow evaluate` rejects it with
+`must be an integer` and wants JSON (`--input '{"rotateWithinDays":14}'`). The
+scheduled path uses `run`, so the `key=value` form above is the right one here.
+
+**Pass the inputs, not just the schedule.** Both defaults are safe rather than
+useful, and getting either wrong fails quietly in a different direction:
+
+| You set | What actually happens |
+| --- | --- |
+| `--schedule` only | `rotate` defaults **false**, so the job checks daily and **never rotates**. It looks healthy forever and the token lapses on time. |
+| `--schedule` + `rotate=true`, no CI variable inputs | Rotation lands, propagation is skipped, and the consumer keeps presenting a value GitLab **already revoked**. An outage on a timer. |
+| all four, as above | Checks daily, rotates inside 14 days, writes the new value to the consumer, and fails the run loudly if that write does not land. |
+
+**Choose the threshold against the consumer's cadence, not the token's.** The
+default 7 is fine for something that runs hourly. If the pipeline that uses this
+token runs *monthly*, a rotation seven days out can land after the last run
+before expiry and before the next one — so nothing exercises the new value until
+the month turns, and a botched handover surfaces as a failed production run
+rather than a failed rotation. Set `rotateWithinDays` wide enough that a human
+still has a run to watch.
+
+**Daily is the right cadence even though rotation is not.** The *check* is what
+runs daily: it catches an authentication failure or an out-of-band revocation
+within 24h. The *rotation* is gated on the threshold, so a daily schedule
+produces at most one rotation per token lifetime, not one per run.
+
+**No notification.** This workflow reports through the run's own success or
+failure and sends nothing. If you want to be told — and for an unattended
+credential rotation you should be — wrap these model methods in a workflow of
+your own and add a notify step. Alert separately on a failed *propagate*: by
+that point the outgoing token is already revoked, so it is an outage, not a
+warning.
 
 | Input | Default | Effect |
 | --- | --- | --- |
@@ -292,6 +357,31 @@ including the one just rotated away, sitting at zero days remaining forever. An
 workflow gated on it would rotate again on every subsequent run. `managed` holds
 only the generation in play, so the predicate goes false the moment a fresh
 token is issued.
+
+### Propagation is gated on a fresh secret, not on the threshold
+
+The subtlest thing in this file, and `2026.08.29.1` got it wrong. By the time
+`propagate` runs, `rotate` has **already overwritten `managed`** with the new
+token -- which has a full lifetime ahead of it. So a days-remaining predicate on
+the propagate step is **false exactly when propagation was needed**: the old
+value is revoked, the new one is never published, and the run reports success.
+
+The signal is "did *this run* produce a secret". `rotate` writes the snapshot
+and the secret in one call with a single `observedAt`; a plain `sync` refreshes
+`managed` alone. So:
+
+```
+data.latest('gitlab-token', 'current').?attributes.?observedAt.orValue('')
+  == data.latest('gitlab-token', 'managed').?attributes.?observedAt.orValue('-')
+```
+
+is exactly "a rotation occurred in this run", and false on the first run when
+`current` does not exist.
+
+**Safe-navigate every data reference in a step's inputs.** A step's inputs are
+evaluated even when its `when` is false -- `when` gates execution, not
+evaluation -- so the plain `.attributes.token` form kills the run with
+`No such key: attributes` before any rotation has happened.
 
 **Wire the consumer before enabling rotation.** The replacement value lands in
 the `secret` resource and nowhere else. A rotation whose output nothing reads is

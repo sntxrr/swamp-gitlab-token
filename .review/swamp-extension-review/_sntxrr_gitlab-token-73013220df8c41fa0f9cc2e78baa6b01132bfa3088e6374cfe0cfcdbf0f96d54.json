@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/gitlab-token",
+  "version": "2026.08.29.2",
+  "reviewedAt": "2026-08-29T22:30:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The one change with a credential in it is the propagate step's `value`, and it moves in the safe direction: from an unguarded `.attributes.token` to a safe-navigated read with a placeholder chosen so that WRITING it is refused. The placeholder contains spaces, which GitLab's masking rules forbid, so a masked write returns 400 and the model raises rather than landing a junk value in a live CI variable. It is unreachable anyway \u2014 the `when` beside it is false whenever `current` is missing \u2014 but a credential write should be both unreachable and harmless if reached. The 13 `credentials-sensitive-field` rule warnings are the same known false positives recorded last pass: the heuristic matches any field whose name contains token/name/id/description/search, so it fires on `id: z.string().describe(\"Token ID.\")`. Marking those sensitive would vault identifiers and break data.latest lookups."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "No logging code changed. Worth recording how this release's defect was actually found, since it was not by a log: the extension's workflow registered its own 06:40 schedule on a host that already had one, and that was visible only by reading `swamp serve`'s scheduler registry after a restart and counting the entries \u2014 8 where 7 were expected. Nothing warned. An extension-shipped `trigger:` is silent by construction."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "The failure mode this release removes is an evaluation error, not a caught one: `data.latest('gitlab-token','current').attributes.token` raises `No such key: attributes` before any rotation exists, killing the run. Observed live, not inferred. Safe navigation with `.?attributes.?token.orValue(...)` removes it. The prior pass's open note on the 400-while-masked branch is unchanged and still stands."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "62 tests, two new, both over the shipped workflow file because that is where both defects lived and no model test could see either. One asserts `trigger` is absent. The other asserts propagate's `when` mentions `observedAt` and does NOT mention `daysRemaining` \u2014 the negative half is the one that matters, since reverting to the threshold is the exact regression \u2014 and that `value` and `tokenId` are safe-navigated. Still no test that a rotation actually propagates end to end; that needs a live rotation and is called out under idempotency below."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "The propagate predicate changes from a threshold to `current.observedAt == managed.observedAt`, which is stable under re-runs in a way the old one was not \u2014 but in the opposite direction to the obvious reading. The OLD predicate was not merely wrong, it was wrong in a way that produced silence: after rotate updated `managed`, the threshold went false and propagate was skipped, so the run reported success having revoked a credential and published nothing. The new one is true exactly for the run that produced the secret. Verified by construction \u2014 `rotate` computes one `observedAt` and passes it to both `toTokenResource` and the secret object \u2014 and negatively in a live homelab run where a non-rotating sync left the stamps different and propagate correctly did nothing. NOT verified positively: that requires a real rotation, which would burn a production token 89 days early. Stated as a gap rather than claimed as tested."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "No GitLab API surface changed. One swamp contract is now honoured rather than abused: an extension may ship a workflow, but scheduling it is the host operator's decision. The README shows `swamp workflow trigger set` for hosts that want the author's cadence. One CLI inconsistency found while verifying the documented commands and recorded in the README rather than left as a trap: `swamp workflow run --input rotateWithinDays=14` coerces the string against the declared type, but `swamp workflow evaluate` rejects the same form with `must be an integer` and requires JSON. The scheduled path uses `run`, so the documented form is correct \u2014 but a reader who reaches for `evaluate` to debug their expressions would hit a confusing error."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No spec, instance, alias or GC change. Read paths only."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "The headline fix, and a second one in the same place as last release. `2026.08.29.1` shipped a `trigger:` in its workflow, so installing the extension registered a daily 06:40 job on every host \u2014 at a time this author picked, against whatever instance matched the hardcoded name `gitlab-token`. On the first host to install it, that instance existed and was managing a production token, and the vendored job landed ten minutes before the operator's own schedule. Worse, the job it registered was the one whose propagate step dies on evaluation, so it would have failed daily with no alert, since the shipped workflow has no notification. Removing the trigger is the fix; the README now says why, and a test asserts it. Pattern worth naming: for two consecutive releases the defect was in the workflow file rather than the model, and both times every model-level signal was green. Re-reviewed after the scheduling documentation was expanded, which is the half of this change that decides whether removing the trigger helps or merely shifts the failure. Dropping a built-in schedule without telling people how to set one turns an unwanted job into no job at all, which is the quieter failure of the two. The README now carries a `Scheduling it` section with the full `swamp workflow trigger set` invocation INCLUDING its inputs, a `trigger get` to confirm it took, the `remove` to undo it, and a table naming what goes wrong when only some inputs are passed: schedule alone leaves `rotate` false so the job checks forever and never rotates, while `rotate=true` without the CI-variable inputs rotates and skips the handover. Every command in that section was run before it was written; `trigger get` after `remove` reporting `schedule: (none)` is also the positive proof that the built-in trigger is genuinely gone."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "No zod schema changed. One describe() string now shows the safe-navigated form rather than the plain one, because the plain form it previously recommended is the exact expression that kills a run."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "na",
+      "note": "Nothing in this release touches resource lifetimes or garbage collection. The prior pass's open note \u2014 whether swamp counts versions per instance or across a spec, still unverified \u2014 carries forward unchanged and is not made better or worse here."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Verb set unchanged: sync, create, rotate, delete, list, update-ci-variable."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "issue",
+      "note": "`valid-target` reads the RAW globalArguments rather than the zod-parsed ones, so an instance that relies on the documented `baseUrl` default fails its own preflight with `baseUrl \"undefined\" must be an absolute http(s) URL`. Reproduced on both homelab instances; writing `baseUrl: https://gitlab.com` explicitly clears it. NOT fixed in this release \u2014 the fix belongs in the check, and this release is deliberately workflow-only, so bundling a model change would make the no-op upgrade entry a lie. Recorded as an open issue rather than carried silently, and the workaround is documented at both call sites."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "No instance or alias name changed. The hardcoded `modelIdOrName: gitlab-token` is now less dangerous than it was, because without a built-in trigger the workflow only acts on that instance when an operator runs or schedules it deliberately. The name is still hardcoded and still a sharp edge for anyone with a differently-named instance; unchanged from previous passes and still documented."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "The substantive change. `propagate` previously gated on `managed.daysRemaining <= rotateWithinDays`, evaluated AFTER `rotate` had overwritten `managed` with the new token \u2014 so the predicate was false precisely when propagation was required. That is not a tidiness fix: it is the difference between a rotation and an outage, and the run reported success either way. The replacement compares the two `observedAt` stamps, which are written by one call during a rotation and diverge on any sync-only run. Both sides are safe-navigated with defaults chosen so an absent `current` yields inequality, making the first run correctly a no-op."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.08.29.2, with a second no-op upgrade entry. The entry is required even though nothing migrates: without one, instances stay pinned to their old typeVersion and never see the release. Its description says the thing an upgrade cannot do \u2014 an operator who VENDORED a copy of the workflow holds the broken one, and no upgrade reaches a file outside the extension. The model's own `version` field had to be bumped alongside the manifest's; a mismatch is rejected as an upgrade-chain error, which is a good gate and was caught by `swamp extension quality` before any push."
+    }
+  ]
+}
