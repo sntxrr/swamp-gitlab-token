@@ -424,6 +424,23 @@ swamp workflow list | grep gitlab-token-rotation   # empty means it did not load
 - a `project`/`group` scope with no `namespace`
 - a `namespace` set on a `personal` scope
 - a `baseUrl` that is not absolute, or that already contains `/api/v4`
+- both `tokenId` and `tokenName` set, which can disagree the moment a rotation
+  lands
+
+**It reads the instance as written, defaults included.** A check runs against
+the raw YAML, *before* the schema applies its defaults, so anything omitted
+arrives as `undefined` — and until `2026.08.29.3` this check compared those
+against literals. The effect was that the **minimal valid instance failed its
+own preflight**: setting only `token` and taking every documented default
+produced two errors, one of which sent you in a circle (`tokenScope
+"undefined" requires namespace` → set a namespace → `namespace is set but
+tokenScope is personal`). Neither message was about the real problem, because
+the real problem was that neither field had been read.
+
+Fixed by resolving the defaults inside the check from the same named constants
+the schema uses, so the two cannot drift. If you wrote `baseUrl` or
+`tokenScope` out explicitly to work around it, you can drop them or keep them —
+both are correct now.
 
 ## Notes
 

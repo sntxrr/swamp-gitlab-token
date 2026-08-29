@@ -13,7 +13,11 @@ import {
 } from "jsr:@std/assert@1";
 import { parse } from "jsr:@std/yaml@1";
 import {
+  _internal,
   collectionPath,
+  DEFAULT_BASE_URL,
+  DEFAULT_TIMEOUT_MS,
+  DEFAULT_TOKEN_SCOPE,
   createPath,
   daysUntil,
   model,
@@ -1229,3 +1233,53 @@ Deno.test("propagate gates on a fresh secret, not on the expiry threshold", asyn
     assertStringIncludes(inputs[key], "orValue");
   }
 });
+
+// --- valid-target against RAW configuration ---------------------------------
+//
+// These deliberately do NOT spread `G`. Every existing valid-target test does,
+// and that is precisely why this shipped: `G` supplies `baseUrl` and
+// `tokenScope` by hand, so no test ever saw what swamp actually passes. A check
+// runs against the instance YAML as written, before the schema applies its
+// defaults, so an omitted field arrives as `undefined`.
+
+Deno.test("valid-target passes the minimal instance, which sets only token", () => {
+  // The whole config an operator needs if they take every documented default.
+  // 2026.08.29.2 failed this with two errors.
+  const r = model.checks["valid-target"].execute({
+    globalArgs: { token: "glpat-x" } as never,
+  });
+  assertEquals(result_errors(r), []);
+  assertEquals(r.pass, true);
+});
+
+Deno.test("valid-target resolves defaults from the same constants as the schema", () => {
+  // Not a tautology: it asserts the check reads the CONSTANT, so changing the
+  // schema's default cannot silently leave the check comparing the old literal.
+  const parsed = _internal.GlobalArgsSchema.parse({ token: "glpat-x" });
+  assertEquals(parsed.baseUrl, DEFAULT_BASE_URL);
+  assertEquals(parsed.tokenScope, DEFAULT_TOKEN_SCOPE);
+  assertEquals(parsed.timeoutMs, DEFAULT_TIMEOUT_MS);
+});
+
+Deno.test("valid-target still catches a real fault in raw configuration", () => {
+  // The fix must not turn the check into a no-op: with tokenScope supplied and
+  // wrong, and baseUrl still absent, exactly one error should fire.
+  const r = model.checks["valid-target"].execute({
+    globalArgs: { token: "glpat-x", tokenScope: "project" } as never,
+  });
+  assertEquals(r.pass, false);
+  assertEquals(result_errors(r).length, 1);
+  assertStringIncludes(result_errors(r)[0], "requires namespace");
+});
+
+Deno.test("valid-target reports a malformed baseUrl the operator did supply", () => {
+  const r = model.checks["valid-target"].execute({
+    globalArgs: { token: "glpat-x", baseUrl: "gitlab.example.com" } as never,
+  });
+  assertEquals(r.pass, false);
+  assertStringIncludes(result_errors(r)[0], "must be an absolute http(s) URL");
+});
+
+function result_errors(r: { pass: boolean; errors?: string[] }): string[] {
+  return r.errors ?? [];
+}
