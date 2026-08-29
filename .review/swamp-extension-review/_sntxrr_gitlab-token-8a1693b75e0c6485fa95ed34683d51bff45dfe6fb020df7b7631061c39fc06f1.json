@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/gitlab-token",
+  "version": "2026.08.29.1",
+  "reviewedAt": "2026-08-29T00:00:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Unchanged from the previous pass on this release and re-checked against the new code. `value` on update-ci-variable is sensitive; the ci-variable resource carries no value, asserted by a test. `tokenName` is an identifier, not a secret, and is logged deliberately when resolved \u2014 a run must be able to say which token it acted on. One security property worth stating because it is easy to miss: name-based resolution could in principle be attacked by creating a second token with the same name in the same scope, and the resolver FAILS CLOSED on that \u2014 duplicates raise rather than pick, so the attack yields an outage, not a hijacked rotation."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "resolveTokenId logs the name-to-id resolution at info, which is the line an operator needs when a rotation acted on a different generation than expected. Structured props throughout; no secret is interpolated. Error paths name the offending values (ids, names, counts) rather than saying 'invalid'."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Four distinct failure modes get four distinct messages: both identifiers set, no active match, multiple active matches (listing the ids), and neither set. Each names what to do rather than what went wrong. The 'no active token named X' message calls out renaming specifically, because a rename is the one silent way to break this lookup and the API's own 404 would not hint at it. Carried forward from the previous pass: the 400-while-masked branch attributes the failure to masking rules whenever masked=true, which can misdirect on a 400 with another cause; mitigated by appending the original error."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "58 tests, all mocked, no live calls. Eleven are new and each targets a way this could silently do the wrong thing rather than merely fail: exact-name resolution, a substring neighbour NOT being picked (GitLab's search is a substring match, so 'sm-deploy' also returns 'sm-deploy-staging' \u2014 rotating the neighbour would be unrecoverable), a revoked same-name generation being skipped, duplicates refused with both ids named, no-match, both-identifiers-set, a pinned tokenId spending no resolving call, `managed` tracking the generation in play, `managed` updated on delete rather than left claiming a live token, and the two alias names never colliding \u2014 asserted against what the model actually writes, not against the constants."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Resolution is stateless and repeated fresh on every run, which is the point: no cached id can go stale. Costs one extra listing call per method when tokenName is used, judged a fair price for correctness across rotations. The resolving call inherits gitlabListAll's pagination bound and gitlabFetch's 429/503 retry. An explicit tokenId still short-circuits with no extra call, asserted by a test."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Resolution uses the existing collection endpoint with state=active and search=<name>, then filters client-side for an exact name and a non-revoked record. The client-side narrowing is deliberate rather than redundant: GitLab's search is documented as a substring match and its state filter is not a substitute for checking `revoked`."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One new alias instance, `managed`, on the existing `token` spec \u2014 no new spec. Written by sync, create, rotate AND delete, the last so a revoked token does not leave `managed` claiming something live. `list` deliberately does not write it: a factory over many tokens has no single managed generation, and picking one would be a fabrication."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "README gains an 'identify by name, not by ID' section with both forms shown side by side, a 'managed alias' section explaining why the obvious predicate is wrong, an updated writes row, the tokenName row in the globals table, and tokenName in the create example. Module docstring item 3 now explains why an id is the wrong thing to configure. The workflow description tells the reader to use tokenName for anything it will rotate, and says what breaks otherwise."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "tokenName is optional with no default, which is what keeps this a no-op upgrade. Mutual exclusion with tokenId is enforced in two places \u2014 the preflight check for early feedback and the resolver for the methods the preflight does not fire on \u2014 rather than expressed in the zod schema, because a refinement there would reject the config before the clearer message could be produced."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "No spec or GC change. `managed` is one more instance on the existing `token` spec at GC 30. Noted rather than asserted, same as last pass: whether swamp's garbage collection counts versions per instance or across a spec is unverified, and the alias adds one write per method call. If per-instance, this is neutral. Flagged so the next reader checks rather than assumes."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "No change to the verb set. The identity by which those verbs address a token is what changed, and it now has two forms with a documented rule for choosing: name for anything that rotates, id to pin one generation, self for the authenticating token."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "valid-target gains the mutually-exclusive-identifier check, so a bad config is caught before create or delete rather than mid-method. The known limitation is unchanged and still recorded: swamp fires checks only on create/update/delete/action-named methods, so neither sync nor update-ci-variable gets a preflight \u2014 which is exactly why the same rule is ALSO enforced inside resolveTokenId rather than only in the check."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "The alias name `managed` was chosen specifically to avoid colliding with the `secret` spec's `current`, shipped earlier in this same version. Two specs sharing one instance name would make data.latest(model, name) ambiguous between metadata and a secret, and that failure would present as a silent wrong-field read rather than an error. A test asserts uniqueness against what the model writes rather than against the constants, so renaming either alias into a collision fails the suite."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "The workflow's threshold moves from findBySpec(...).exists(...) to data.latest(model,'managed'), which fixes a real latent bug rather than merely tidying: findBySpec returns every generation including the one just rotated away, sitting at zero days forever, so the exists() stayed true permanently once any token neared expiry and the workflow would have rotated on every subsequent run. `.?attributes.?daysRemaining.orValue(99999)` covers a null expiry and an absent first snapshot, both defaulting far outside any threshold so absence of evidence never reads as due-for-rotation."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "globalArguments DID grow this time \u2014 tokenName was added \u2014 and the upgrade is still deliberately a no-op. tokenName is optional with no default, so there is nothing to backfill, and synthesising a name for an instance configured by id would be a guess at which token the author meant. Existing instances keep working on tokenId, including its rotation weakness; moving to tokenName changes which token a rotation acts on and is therefore an operator's edit, not something an upgrade should do unasked. Target version is still 2026.08.29.1 because that version was merged but never published \u2014 verified against the registry, which reports currentPublished 2026.08.19.2."
+    }
+  ]
+}

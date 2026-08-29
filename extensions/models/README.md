@@ -8,7 +8,7 @@ and group — through one model.
 | Model | `@sntxrr/gitlab-token` |
 | Methods | `sync`, `list`, `create`, `rotate`, `delete`, `update-ci-variable` |
 | Workflow | `@sntxrr/gitlab-token-rotation` — daily check, threshold-gated rotation |
-| Writes | `token` (metadata) per token, `secret` (vaulted value) on create/rotate, `ci-variable` (audit) on propagation |
+| Writes | `token` (metadata, plus a `managed` alias), `secret` (vaulted value, plus a `current` alias), `ci-variable` (audit) |
 | Auth | A GitLab token with `api` scope, sent as `PRIVATE-TOKEN` |
 
 ## Why one model and not three
@@ -137,12 +137,57 @@ GitLab's rotate revokes the current token immediately and issues a replacement
 under a **new ID**. Re-presenting the old value triggers reuse detection, which
 revokes the entire token family — not just the token you replayed.
 
-Two consequences this model bakes in:
+Consequences this model bakes in:
 
 - The new snapshot is keyed by the **new** ID. Writing the successor under the
   old ID would erase the record of what was just retired.
 - If a rotate returns no value, that is an **outage**, not a no-op: the previous
   token is already dead. It is logged as a warning rather than passed over.
+- **An ID is the wrong thing to configure.** See below.
+
+### Identify the token by name, not by ID
+
+`tokenId` names one generation, and stops being true the first time that
+generation rotates. Every run afterwards authenticates fine and then operates on
+a revoked token — the model manages a corpse and reports success at it.
+
+```bash
+# rotation-stable: resolved to the live id on every run
+--global-arg tokenName=ci-deploy
+
+# pins one generation; correct for inspection, wrong for a rotation schedule
+--global-arg tokenId=17220677
+```
+
+Set one or the other — both together is a configuration error, because they can
+disagree the moment the token rotates and silently picking one would mean acting
+on whichever the author did not mean. `tokenId=self` is already stable and needs
+no name.
+
+Name resolution matches **exactly** and only among active tokens. GitLab's
+`search` is a substring match, so `ci-deploy` would otherwise also return
+`ci-deploy-staging`; and duplicates are refused rather than guessed between,
+because rotating or revoking the wrong one is not recoverable.
+
+### The `managed` alias
+
+Metadata is written twice: keyed by the real ID, and under `managed`.
+
+A threshold predicate cannot be written against the ID-keyed spec.
+`findBySpec` returns **every** generation, including the one just rotated away,
+which sits at zero days remaining forever — so `exists(t, t.daysRemaining <= 7)`
+stays true for good once any token has neared expiry, and a workflow gated that
+way rotates on every run after the first. `managed` holds only the generation in
+play:
+
+```
+${{ data.latest("deploy-token", "managed").attributes.daysRemaining }}
+```
+
+It is deliberately not called `current`: that name already belongs to the newest
+`secret`, and two specs sharing one instance name would make
+`data.latest(model, name)` ambiguous between metadata and a secret — a silent
+wrong-field read rather than an error.
 
 ## Usage
 
@@ -157,7 +202,8 @@ swamp model create @sntxrr/gitlab-token deploy-token \
   --global-arg 'token=${{ vault.get("gitlab", "ADMIN_TOKEN") }}' \
   --global-arg baseUrl=https://gitlab.example.com \
   --global-arg tokenScope=project \
-  --global-arg namespace=marsh-works/deploy-bot
+  --global-arg namespace=marsh-works/deploy-bot \
+  --global-arg tokenName=ci-deploy
 
 # provision — the value lands in the vaulted `secret` resource
 swamp model @sntxrr/gitlab-token method run create deploy-token \
@@ -178,7 +224,8 @@ swamp model @sntxrr/gitlab-token method run rotate deploy-token \
 ```
 
 Set `tokenId=self` to rotate the token doing the authenticating — the token
-needs `api` or `self_rotate` scope to do that.
+needs `api` or `self_rotate` scope to do that. For any other token prefer
+`tokenName`, which survives the rotation it is about to perform.
 
 ### Inventory what is about to lapse
 
@@ -252,7 +299,8 @@ an outage you scheduled.
 | `baseUrl` | no | `https://gitlab.com` | Instance root, **without** `/api/v4`. |
 | `tokenScope` | no | `personal` | `personal`, `project` or `group`. |
 | `namespace` | for project/group | — | `group/repo` or a numeric ID. URL-encoded automatically. |
-| `tokenId` | for all but `create` | — | Token ID, or the literal `self`. |
+| `tokenId` | one of these two | — | Token ID, or the literal `self`. Pins one generation; not rotation-stable. |
+| `tokenName` | one of these two | — | Token name, resolved to the live ID each run. Prefer for anything that rotates. |
 | `userId` | no | — | Admin PAT creation for that user. |
 | `timeoutMs` | no | `15000` | Per-request timeout. |
 
