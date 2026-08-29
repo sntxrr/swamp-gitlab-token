@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/gitlab-token",
+  "version": "2026.08.29.1",
+  "reviewedAt": "2026-08-29T21:45:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "No change to how secrets are handled; carried forward and re-checked. `value` on update-ci-variable stays sensitive, the ci-variable resource still carries no value, and the new workflow `id` is a public identifier by design. The push rule engine emits 13 `credentials-sensitive-field` warnings on this file and every one is a FALSE POSITIVE: the heuristic matches any field whose name contains 'token', 'name', 'id', 'description' or 'search', so it fires on `id: z.string().describe(\"Token ID.\")` and on `search: Filter by token name`. Marking those sensitive would vault identifiers, break `data.latest` lookups against them and make error messages unable to name the token they failed on. Recorded rather than suppressed so the next reviewer does not re-litigate it, and so a genuine future hit in that dimension is not lost in a wall of known noise."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Unchanged code paths. One observation the earlier passes should have caught and did not: the failure this release fixes was ANNOUNCED in the logs \u2014 `[WRN] extension-workflow-repo: Skipping broken extension workflow` fired on every `swamp workflow list`, `quality` and `push` \u2014 and was read as noise because the zod error it carries is printed as a multi-line escaped JSON blob after the message, so the human-readable half scrolls out of view. The lesson is about reading warnings, not about this extension's own logging, which remains structured and secret-free."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "No new error paths in the model. The prior pass's open note stands: the 400-while-masked branch attributes a failure to masking rules whenever masked=true, which can misdirect on a 400 with a different cause, mitigated by appending the original error. The corrected `value` describe() removes a documentation error that would have produced a hard-to-diagnose runtime failure \u2014 it told the reader to wire the consumer from `data.findBySpec('gitlab-token','secret')`, which returns every generation with no ordering, so following it could write a REVOKED token over a live one and the pipeline would fail on its next run with a 401 rather than at wiring time."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "60 tests, all mocked. Two are new and both assert over the shipped workflow FILE rather than the model, which is the gap this release closes: nothing in the build path parsed that file, so a fatal defect in it was invisible to a full green suite, a 100% quality score and two prior adversarial reviews. The first asserts a top-level lowercase-UUID `id`, plus name and non-empty jobs. The second asserts the propagate job depends on a SUCCEEDED rotate and that its single step keeps allowFailure false \u2014 the one allowFailure in the file whose inversion would report a green run over a consumer holding a revoked credential. Both tests parse with @std/yaml rather than regexing the text, so a structurally valid file that moved the field cannot pass them. Writing the second test found a real error in my own first draft: I asserted allowFailure at the JOB level, where it is undefined, which is precisely the class of mistake an assertion over the real file catches and an assertion over a constant does not."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "No runtime behaviour changed. The workflow's own resilience posture is unchanged and now actually reachable, which is the substantive difference: `swamp workflow validate` passes 13 checks including acyclicity of every job and step graph, and could not be run at all before this fix because the file did not load."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "No GitLab API surface changed. The contract that changed is with SWAMP: a workflow file must declare a top-level UUID `id`. That requirement is undocumented in the extension-authoring path and unenforced by `swamp extension push`, which packages and publishes a workflow it will not itself load. This report records it as an upstream gap, not as a defect introduced here."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No spec, instance or alias change. The three-job DAG (check \u2192 rotate \u2192 propagate) and the resources each job writes are unchanged from the merged state; only their reachability changed."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Verdict is `pass` for the code as it now stands; the finding below is what this pass FOUND and fixed, recorded because the gate has no 'was broken' verdict and the history is the useful part. This is the finding of the release, and it is a hygiene failure of exactly the kind this dimension exists to catch. Version 2026.08.19.2 published a rotation workflow that could never run. `swamp workflow list` omitted it, `swamp workflow run @sntxrr/gitlab-token-rotation` answered 'Workflow not found' for a file sitting in the repo, and `swamp workflow validate` could not evaluate it. The extension nonetheless packaged, published, scored 100% and reported `Workflows (1)` in `swamp extension info`, because the manifest records that a workflow file EXISTS, not that it parses. Two prior adversarial reviews on this same version passed this dimension without ever running the artifact they were reviewing. Fixed by adding the id; guarded by a test; documented in a new README subsection so a fork does not repeat it. Two stale claims introduced by the preceding change were also corrected here: the README still described a 'two-job workflow' after propagate made it three, and still explained the threshold predicate as using findBySpec after it had been repointed at the `managed` alias \u2014 the second being actively misleading, since it documented the exact bug that change removed."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "No zod schema changed. One describe() string was corrected. The workflow file's own schema is now satisfied rather than silently violated."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "No spec or GC change. The prior pass's open note is carried forward unresolved and deliberately: whether swamp's garbage collection counts versions per instance or across a spec is still unverified, and the `managed` and `current` aliases each add one write per method call. Flagged again so the next reader checks rather than assumes."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Verb set unchanged: sync, create, rotate, delete, list, update-ci-variable."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "valid-target is unchanged. Worth stating plainly that no preflight could have caught this release's defect: swamp's checks run against a model INSTANCE, and the broken artifact was a workflow file, which no check ever evaluates. That is why the guard added here is a test over the file rather than another check."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "No instance name changed. The workflow `id` is a new identifier in a different namespace and cannot collide with the `managed` or `current` resource aliases. It is fixed rather than per-install: it identifies this workflow the way its name does, and run history attaches to the workflow \u2014 `swamp workflow delete` is documented as removing 'a workflow and its run history' \u2014 so an id that varied per pull would fragment that history. The stronger claim that swamp keys history BY the id specifically was not verified, and the comment in the file was weakened to match what was actually confirmed."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "No CEL expression changed. All three jobs' expressions are unchanged from the merged state and are now, for the first time, actually parsed by `swamp workflow validate`, which passes. The remaining three validate warnings are 'model instance not found' for `gitlab-token` on each step; that is expected and correct \u2014 the instance is created in swamp-homelab, which is not yet wired, and is the next task rather than a defect here."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "Target stays 2026.08.29.1 and the upgrade entry stays a no-op, both still correct: no persisted resource shape, global argument or default changed in this pass. Re-verified against the registry, which still reports currentPublished 2026.08.19.2, so this release carries the update-ci-variable method, the tokenName identifier and this fix as one version. One dependency note: the tests now import jsr:@std/yaml@1, but the manifest packages only gitlab_token.ts, README.md and LICENSE.md \u2014 the test file is not in the published archive, so this is a dev-only dependency and the published surface still has none. Confirmed by the archive contents rather than assumed."
+    }
+  ]
+}
