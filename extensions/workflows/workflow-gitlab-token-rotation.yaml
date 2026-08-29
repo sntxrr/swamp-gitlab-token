@@ -60,6 +60,21 @@ inputs:
         GitLab's default, which is one week where an expiry is mandatory and
         the instance maximum otherwise.
       default: ""
+    ciVariableProject:
+      type: string
+      description: >-
+        Project owning the CI/CD variable that consumes this token, as a path
+        (group/repo) or numeric ID. Leave empty to skip propagation entirely —
+        appropriate when the consumer is something other than a GitLab CI
+        variable. Note this is usually NOT the project that owns the token.
+      default: ""
+    ciVariableKey:
+      type: string
+      description: >-
+        Name of the CI/CD variable to update with the rotated value, e.g.
+        GITLAB_PUSH_TOKEN. Empty skips propagation. The variable must already
+        exist — the model updates, it does not create.
+      default: ""
   required: []
 jobs:
   - name: check
@@ -121,3 +136,54 @@ jobs:
         condition:
           type: succeeded
     weight: 1
+  - name: propagate
+    description: Carry the rotated value through to the consumer that reads it
+    steps:
+      - name: update-ci-variable
+        description: >-
+          The step that turns a rotation into a completed handover rather than
+          an outage. GitLab discloses a token value exactly once; if nothing
+          writes it to the consumer, the previous value is already revoked and
+          the pipeline that depended on it fails on its next run.
+
+          Reads the value from the `current` alias, NOT from a snapshot keyed by
+          token ID. Rotation mints a new ID every time, so an ID-keyed instance
+          cannot be named in a file written beforehand, and `findBySpec` returns
+          every generation with no way in CEL to ask for the newest — a consumer
+          picking wrong would write a REVOKED value over a live one. `current`
+          is always the value issued most recently.
+
+          Gated on the same two conditions as the rotate step plus a configured
+          target, so a run that rotated nothing writes nothing. The model
+          re-asserts `masked` and `protected` on every write, because GitLab
+          does not inherit them and silently unmasking a secret in a public
+          project's job log is the worse failure of the two.
+        task:
+          type: model_method
+          modelIdOrName: gitlab-token
+          methodName: update-ci-variable
+          inputs:
+            project: ${{ inputs.ciVariableProject }}
+            key: ${{ inputs.ciVariableKey }}
+            value: >-
+              ${{ data.latest('gitlab-token', 'current').attributes.token }}
+            tokenId: >-
+              ${{ data.latest('gitlab-token', 'current').attributes.tokenId }}
+            when: >-
+              ${{ inputs.rotate && inputs.ciVariableKey != '' &&
+              inputs.ciVariableProject != '' &&
+              data.findBySpec('gitlab-token', 'token').exists(t,
+              t.attributes.daysRemaining <= inputs.rotateWithinDays) }}
+        dependsOn: []
+        weight: 0
+        # NOT allowFailure, and this is the most important allowFailure decision
+        # in the file. The outgoing token is already revoked by the time this
+        # step runs. Swallowing a failure here would report a green run over a
+        # consumer that is now holding a dead credential — the exact silent
+        # outage the whole workflow exists to prevent.
+        allowFailure: false
+    dependsOn:
+      - job: rotate
+        condition:
+          type: succeeded
+    weight: 2

@@ -6,9 +6,9 @@ and group — through one model.
 | | |
 | --- | --- |
 | Model | `@sntxrr/gitlab-token` |
-| Methods | `sync`, `list`, `create`, `rotate`, `delete` |
+| Methods | `sync`, `list`, `create`, `rotate`, `delete`, `update-ci-variable` |
 | Workflow | `@sntxrr/gitlab-token-rotation` — daily check, threshold-gated rotation |
-| Writes | `token` (metadata) per token, `secret` (vaulted value) on create/rotate |
+| Writes | `token` (metadata) per token, `secret` (vaulted value) on create/rotate, `ci-variable` (audit) on propagation |
 | Auth | A GitLab token with `api` scope, sent as `PRIVATE-TOKEN` |
 
 ## Why one model and not three
@@ -45,7 +45,20 @@ combination it was handed and refuses *before* spending an API call, naming both
 ways forward rather than letting GitLab's 403 stand in for the explanation.
 
 For automation, a **project or group access token is the answer**: Maintainer or
-Owner is enough, any scope is available, and it works on GitLab.com.
+Owner is enough, and any scope is available.
+
+**Except on a GitLab.com Free namespace, where neither exists.** Project and
+group access tokens are a paid feature there; both endpoints answer
+
+```
+400 Bad request - User does not have permission to create project access token
+```
+
+to a group **Owner**, so the message names a permission that no role can grant.
+Check the tier before designing around them — `glab api namespaces/<ns>` and read
+`plan`. On Free, the substitute is a **fine-grained personal access token**,
+which scopes to named projects and individual verbs; note it still carries the
+`glpat-` prefix, so the prefix alone will not tell you which kind you hold.
 
 ## The token value exists exactly once
 
@@ -59,14 +72,64 @@ There is no read path that returns it. So both methods write two resources:
   reference, so the plaintext never lands in the datastore and never reaches a
   log.
 
-Wire a consumer to the vaulted value with CEL:
+The secret is written **twice**: once keyed by the new token ID, which is the
+audit record, and once under the stable name `current`. Wire a consumer to the
+alias:
 
 ```
-${{ data.latest("gitlab-deploy-token", "secret").attributes.token }}
+${{ data.latest("gitlab-deploy-token", "current").attributes.token }}
 ```
+
+The alias is not a convenience. `data.latest` takes a resource *instance* name,
+and every instance of `secret` is keyed by a token ID that did not exist when the
+consumer was written — rotation mints a new one each time. `findBySpec` reaches
+the spec but hands back every generation with no way in CEL to ask for the
+newest, so a consumer would be guessing, and guessing wrong means writing a
+**revoked** value over a live one. `current` is always the value issued most
+recently.
 
 A rotation whose output is not wired somewhere is a self-inflicted outage, which
 is why the secret is a first-class resource rather than a return value.
+
+## Carrying a rotation through to its consumer
+
+Rotating is half a handover. The other half is `update-ci-variable`, which writes
+the new value into a GitLab CI/CD variable:
+
+```bash
+swamp model @sntxrr/gitlab-token method run update-ci-variable deploy-token \
+  --input project=marsh-works/pipeline \
+  --input key=GITLAB_PUSH_TOKEN \
+  --input 'value=${{ data.latest("deploy-token", "current").attributes.token }}'
+```
+
+| Argument | Default | Notes |
+| --- | --- | --- |
+| `project` | — | Project owning the variable. Usually **not** the project that owns the token. |
+| `key` | — | Variable name. Must already exist. |
+| `value` | — | Sensitive. Wire from the `current` alias. |
+| `masked` | `true` | Re-asserted on every write. |
+| `protected` | `true` | Re-asserted on every write. |
+| `environmentScope` | `*` | Disambiguates variables sharing a key across environments. |
+| `tokenId` | — | Recorded on the audit resource for linkage. |
+| `when` | `true` | Same gate convention as `rotate` and `delete`. |
+
+**It updates and will not create.** A missing variable is an error naming both
+the key and the project, not an upsert. Creating one would turn a mistyped key
+into a variable nothing reads, while the real consumer went on reading the value
+the rotation had just revoked — a silent outage reported as a green run.
+
+**`masked` and `protected` are re-asserted, not inherited.** GitLab does not
+carry them forward on an update, so omitting them can silently unmask a variable
+that was masked before, and the next pipeline prints the secret. If GitLab
+reports the value as unmasked after a write that asked for masking, the method
+records the audit resource and *then* fails the run — the value is live and in a
+log by that point, so it is an incident, not a warning.
+
+It writes a `ci-variable` resource carrying the fact of the write and its safety
+flags, never the value. That is what makes a closed loop distinguishable from an
+open one: `secret` proves a value was issued, `ci-variable` proves something was
+wired to receive it.
 
 ## Rotation is generational
 
@@ -158,6 +221,8 @@ swamp workflow run @sntxrr/gitlab-token-rotation --input rotate=true
 | `rotate` | `false` | Permit rotation at all. The default makes the scheduled run read-only. |
 | `rotateWithinDays` | `7` | Rotate only at or below this many days remaining. |
 | `expiresAt` | `""` | Expiry for the replacement, `YYYY-MM-DD`. Empty takes GitLab's default. |
+| `ciVariableProject` | `""` | Project whose CI/CD variable consumes the token. Empty skips propagation. |
+| `ciVariableKey` | `""` | Variable to update with the rotated value. Empty skips propagation. |
 
 **Two independent gates, both of which must hold.** `rotate=true` alone does
 nothing to a token with 60 days left, so re-running the workflow by hand cannot
