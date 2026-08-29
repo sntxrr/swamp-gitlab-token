@@ -280,7 +280,8 @@ Deno.test("create posts scopes and access_level, and vaults the value separately
   assertEquals(body.access_level, 40);
   assertEquals(body.expires_at, "2026-09-18");
 
-  assertEquals(writes.length, 2);
+  // token metadata, the id-keyed secret, and the `current` alias.
+  assertEquals(writes.length, 3);
   const meta = writes.find((w) => w.spec === "token")!;
   const secret = writes.find((w) => w.spec === "secret")!;
   assertEquals(meta.name, "77");
@@ -363,7 +364,8 @@ Deno.test("create allows the two scopes GitLab does permit self-service", async 
         ctx,
       ),
   );
-  assertEquals(writes.filter((w) => w.spec === "secret").length, 1);
+  // Two: the id-keyed audit copy and the `current` alias, same value.
+  assertEquals(writes.filter((w) => w.spec === "secret").length, 2);
 });
 
 // --- rotate ----------------------------------------------------------------
@@ -682,7 +684,8 @@ Deno.test("rotate with when=true rotates normally", async () => {
       }),
     () => model.methods.rotate.execute({ when: true }, ctx),
   );
-  assertEquals(writes.filter((w) => w.spec === "secret").length, 1);
+  // Two: the id-keyed audit copy and the `current` alias, same value.
+  assertEquals(writes.filter((w) => w.spec === "secret").length, 2);
 });
 
 Deno.test("delete with when=false revokes nothing", async () => {
@@ -712,4 +715,227 @@ Deno.test("delete with when=false skips before resolving the self keyword", asyn
     () => model.methods.delete.execute({ when: false }, ctx),
   );
   assert(!called, "the skip must short-circuit the self-resolution GET too");
+});
+
+// --- update-ci-variable ----------------------------------------------------
+const CI_ARGS = {
+  project: "group/repo",
+  key: "GITLAB_PUSH_TOKEN",
+  value: "glpat-rotated-value",
+  masked: true,
+  protected: true,
+  environmentScope: "*",
+  when: true,
+};
+
+function ciVarResponse(over: Record<string, unknown> = {}): Response {
+  return new Response(
+    JSON.stringify({
+      key: "GITLAB_PUSH_TOKEN",
+      value: "glpat-rotated-value",
+      masked: true,
+      protected: true,
+      environment_scope: "*",
+      variable_type: "env_var",
+      ...over,
+    }),
+    { status: 200 },
+  );
+}
+
+Deno.test("update-ci-variable PUTs the encoded project and the scope filter", async () => {
+  // The project path carries a slash, and an unencoded one would be read as a
+  // route separator — the same trap collectionPath encodes around.
+  const { ctx } = makeContext(G);
+  let url = "", method = "", body: Record<string, unknown> = {};
+  await withMockedFetch(
+    (u, init) => {
+      url = u;
+      method = String(init.method);
+      body = JSON.parse(String(init.body));
+      return ciVarResponse();
+    },
+    () => model.methods["update-ci-variable"].execute(CI_ARGS, ctx),
+  );
+  assertEquals(method, "PUT");
+  assertStringIncludes(url, "/projects/group%2Frepo/variables/GITLAB_PUSH_TOKEN");
+  assertStringIncludes(url, "filter[environment_scope]=*");
+  assertEquals(body.value, "glpat-rotated-value");
+  assertEquals(body.masked, true);
+  assertEquals(body.protected, true);
+});
+
+Deno.test("update-ci-variable records the write without the value", async () => {
+  // The whole point of the resource is to prove a loop closed; carrying the
+  // value would put a secret in the datastore, which `secret` already vaults.
+  const { ctx, writes } = makeContext(G);
+  await withMockedFetch(
+    () => ciVarResponse(),
+    () =>
+      model.methods["update-ci-variable"].execute(
+        { ...CI_ARGS, tokenId: "99" },
+        ctx,
+      ),
+  );
+  const w = writes.find((x) => x.spec === "ci-variable")!;
+  assertEquals(w.data.key, "GITLAB_PUSH_TOKEN");
+  assertEquals(w.data.masked, true);
+  assertEquals(w.data.tokenId, "99");
+  assert(
+    !JSON.stringify(w.data).includes("glpat-"),
+    "the audit record must not carry the value",
+  );
+});
+
+Deno.test("update-ci-variable with when=false spends no API call", async () => {
+  const { ctx, writes } = makeContext(G);
+  let called = false;
+  await withMockedFetch(
+    () => {
+      called = true;
+      return ciVarResponse();
+    },
+    () =>
+      model.methods["update-ci-variable"].execute(
+        { ...CI_ARGS, when: false },
+        ctx,
+      ),
+  );
+  assert(!called, "when=false must not reach the API");
+  assertEquals(writes.length, 0);
+});
+
+Deno.test("update-ci-variable refuses to create a missing variable", async () => {
+  // Upserting would turn a mistyped key into a variable nothing reads while the
+  // real consumer kept the value this rotation just revoked.
+  const { ctx, writes } = makeContext(G);
+  const err = await assertRejects(
+    () =>
+      withMockedFetch(
+        () => new Response("{}", { status: 404 }),
+        () => model.methods["update-ci-variable"].execute(CI_ARGS, ctx),
+      ),
+    Error,
+  );
+  assertStringIncludes(err.message, "GITLAB_PUSH_TOKEN");
+  assertStringIncludes(err.message, "group/repo");
+  assertStringIncludes(err.message, "will not create one");
+  assertEquals(writes.length, 0);
+});
+
+Deno.test("update-ci-variable names masking rules on a 400", async () => {
+  // GitLab's raw 400 does not say the value failed its masking rules.
+  const { ctx } = makeContext(G);
+  const err = await assertRejects(
+    () =>
+      withMockedFetch(
+        () => new Response("{}", { status: 400 }),
+        () => model.methods["update-ci-variable"].execute(CI_ARGS, ctx),
+      ),
+    Error,
+  );
+  assertStringIncludes(err.message, "masking rules");
+  assertStringIncludes(err.message, "NOT written");
+});
+
+Deno.test("update-ci-variable fails loudly when masking silently did not land", async () => {
+  // An unmasked secret in CI is an incident: the next pipeline prints it.
+  const { ctx, writes } = makeContext(G);
+  const err = await assertRejects(
+    () =>
+      withMockedFetch(
+        () => ciVarResponse({ masked: false }),
+        () => model.methods["update-ci-variable"].execute(CI_ARGS, ctx),
+      ),
+    Error,
+  );
+  assertStringIncludes(err.message, "UNMASKED");
+  // The audit record must survive the failure, or the incident leaves no trace.
+  const w = writes.find((x) => x.spec === "ci-variable")!;
+  assertEquals(w.data.masked, false);
+});
+
+// --- the `current` alias ---------------------------------------------------
+Deno.test("rotate also writes the secret under the stable name current", async () => {
+  // Without this, nothing downstream can address the value just issued: the id
+  // is new every rotation, so no workflow authored earlier can name it.
+  const { ctx, writes } = makeContext(G);
+  await withMockedFetch(
+    () =>
+      new Response(
+        JSON.stringify({ id: 99, name: "deploy", token: "glpat-new" }),
+        { status: 200 },
+      ),
+    () => model.methods.rotate.execute({ when: true }, ctx),
+  );
+  const secrets = writes.filter((w) => w.spec === "secret");
+  assertEquals(secrets.length, 2);
+  assert(secrets.some((s) => s.name === "99"), "id-keyed audit copy missing");
+  assert(secrets.some((s) => s.name === "current"), "current alias missing");
+  // Both must carry the same value, or the alias points at a different secret.
+  assertEquals(secrets[0].data.token, secrets[1].data.token);
+  assertEquals(
+    secrets.find((s) => s.name === "current")!.data.tokenId,
+    "99",
+    "current must record which id it belongs to",
+  );
+});
+
+Deno.test("create also writes the secret under current", async () => {
+  const { ctx, writes } = makeContext(G);
+  await withMockedFetch(
+    () =>
+      new Response(
+        JSON.stringify({ id: 7, name: "ci", token: "glpat-created" }),
+        { status: 200 },
+      ),
+    () =>
+      model.methods.create.execute(
+        { name: "ci", scopes: ["k8s_proxy"], accessLevel: "maintainer" },
+        ctx,
+      ),
+  );
+  const secrets = writes.filter((w) => w.spec === "secret");
+  assert(secrets.some((s) => s.name === "current"), "current alias missing");
+});
+
+Deno.test("a rotation that returns no value writes no current alias", async () => {
+  // A stale `current` is worse than none: a consumer would write a revoked
+  // value over a live one and report success.
+  const { ctx, writes } = makeContext(G);
+  await withMockedFetch(
+    () => new Response(JSON.stringify({ id: 99, name: "deploy" }), { status: 200 }),
+    () => model.methods.rotate.execute({ when: true }, ctx),
+  );
+  assertEquals(writes.filter((w) => w.spec === "secret").length, 0);
+});
+
+Deno.test("update-ci-variable warns when masking is unconfirmed", async () => {
+  // GitLab reporting nothing is not the same as GitLab reporting success; the
+  // caller asked for masking and has no other signal that it held.
+  const { ctx, logs, writes } = makeContext(G);
+  await withMockedFetch(
+    () =>
+      new Response(
+        JSON.stringify({ key: "GITLAB_PUSH_TOKEN", protected: true }),
+        { status: 200 },
+      ),
+    () => model.methods["update-ci-variable"].execute(CI_ARGS, ctx),
+  );
+  assert(
+    logs.some((l) => l.includes("UNCONFIRMED")),
+    "an unreported masked flag must not read as confirmation",
+  );
+  assertEquals(writes.find((w) => w.spec === "ci-variable")!.data.masked, null);
+});
+
+Deno.test("update-ci-variable rejects an empty value before calling the API", async () => {
+  // An empty value would wipe the variable and take the consumer offline while
+  // reporting success. This is the guard against a CEL expression that resolved
+  // to nothing because no rotation had happened yet.
+  const parsed = model.methods["update-ci-variable"].arguments.safeParse({
+    ...CI_ARGS,
+    value: "",
+  });
+  assert(!parsed.success, "an empty value must not be accepted");
 });

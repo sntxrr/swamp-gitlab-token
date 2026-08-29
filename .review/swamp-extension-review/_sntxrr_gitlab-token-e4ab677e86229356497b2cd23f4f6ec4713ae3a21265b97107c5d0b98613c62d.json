@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/gitlab-token",
+  "version": "2026.08.29.1",
+  "reviewedAt": "2026-08-29T00:00:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The new `value` argument is .meta({sensitive:true}), so swamp vaults it and persists a reference. The `ci-variable` resource carries the fact of the write and its safety flags but never the value, asserted by a test that greps the serialised record for a token prefix. No log statement interpolates the value. TWO accepted risks, recorded rather than waved past: (a) gitlabFetch embeds the raw response body in thrown errors, so a secret-carrying request's error text reaches a log \u2014 GitLab's variable-validation 400 returns field names ({\"message\":{\"value\":[\"is invalid\"]}}) rather than the submitted value, so this is judged safe, but it is the one path where a response to a request containing a secret is surfaced verbatim; (b) the `current` alias means a live token value now exists in two vaulted resources instead of one, a real if small increase in blast radius, accepted because the alternative is that no consumer can address the value at all. The scanner's credentials-sensitive-field hits on `tokenId`, `name` and `userId` are false positives: they are identifiers, and marking them sensitive would vault an ID and break the data.latest lookups the workflow depends on."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Structured props throughout, matching the existing methods. The skip path says which key and project it skipped, so a false `when` is legible rather than silent. The unconfirmed-masking path warns explicitly rather than staying quiet, on the principle that 'GitLab said nothing' must not read as 'GitLab said yes'."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "404 raises a message naming the key, the project, the environment scope, and why the method will not upsert. 400-while-masked names GitLab's masking rules, states the value was NOT written, and appends the original error. Everything else rethrows with gitlabFetch's message; 429/503 retry with Retry-After, inherited. ONE honest weakness: the 400 branch attributes the failure to masking whenever masked=true, and a 400 can have other causes (a malformed environment scope, for instance). It is phrased as the likely cause and carries the original error text, so it misdirects rather than lies, but a reader who trusts the first sentence could look in the wrong place."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "47 tests, all with a mocked fetch and no live calls. Ten are new: path and slash-encoding, the scope filter reaching the query string, the audit record carrying no value, when=false spending no API call, the 404 refusal, the 400 masking hint, the masking regression (which asserts BOTH that it throws and that the audit record survived the throw), unconfirmed masking, empty-value rejection at the schema, and the `current` alias on rotate, on create, and its absence when no value came back. Known gap: nothing exercises two variables sharing a key across environment scopes, because the disambiguation happens server-side and the only client-observable surface is the query string, which is asserted."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Re-writing the same value is a harmless no-op PUT, so a re-run after a partial failure is safe. The `when` gate short-circuits before the API call, matching rotate and delete. Transient-status retry is inherited from gitlabFetch. The method deliberately holds no state of its own between runs."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "PUT /projects/:id/variables/:key with filter[environment_scope], which is GitLab's documented disambiguation for variables sharing a key. The project and key are encodeURIComponent'd so a group/repo path is not read as a route \u2014 the same trap collectionPath already encodes around. masked, protected and environment_scope are sent on every write rather than relied upon to persist."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One new spec, `ci-variable`, infinite lifetime and GC 30, matching `token`. Instance name is `project:key` with non-portable characters collapsed to hyphens. Recorded collision risk: projects `a/b` and `a-b` sanitise to the same instance name and would overwrite each other's audit record. Judged acceptable \u2014 it needs two same-named projects differing only by separator in one swamp repo \u2014 but it is a real narrowing, not an impossibility."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "README gains a methods-table row, a writes-table row, a full section on the new method with an argument table and the two safety rationales, and the workflow input rows. The module docstring gains a fifth numbered item. Two CORRECTIONS to previously published text, both verified live against gitlab.com rather than assumed: the wiring example read data.latest(model,'secret'), which cannot work because `secret` is a spec name and data.latest takes an instance name; and the claim that project/group tokens 'work on GitLab.com' is false on a Free namespace, where both endpoints refuse a group Owner."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "project, key and value are all .min(1). The value guard is load-bearing rather than decorative: it is what stops a CEL expression that resolved to nothing \u2014 because no rotation had happened yet \u2014 from wiping the variable and taking the consumer offline while reporting success. masked and protected default true; environmentScope defaults to '*'; tokenId is optional because it is audit linkage, not control flow. `key` is not validated against GitLab's variable-name grammar; an invalid key is encoded, 404s, and produces the actionable message, which is judged better than duplicating GitLab's rules locally."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "ci-variable takes GC 30, matching token, on the reasoning that the audit trail of a rotation reaching its consumer is worth as much history as the token metadata. Noted, not asserted: rotate and create now write `secret` twice per call, once id-keyed and once as `current`. If swamp's GC counts versions per instance name this is neutral \u2014 the id-keyed instances hold one version each and `current` accrues them. If it counts across the spec, effective secret history shortens. Unverified either way; flagged so the next reader checks rather than assumes."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "The token lifecycle is unchanged and complete. update-ci-variable is deliberately partial \u2014 update only, never create or delete \u2014 and this is the design, not an omission: creating a missing variable would turn a mistyped key into a variable nothing reads while the real consumer went on holding a revoked value, which is a silent outage reported as a green run. Documented in the error text, the README and the code comment."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Unchanged and still a known limitation. swamp auto-fires checks only on methods named create/update/delete/action, so `valid-target` does not run before update-ci-variable. For this method that is mostly right \u2014 it uses neither namespace nor tokenScope \u2014 but it also means baseUrl is unvalidated on this path. The method's own 404 and 400 handling covers the failure modes that matter here. This surfaces as the same non-blocking warning the extension has carried since publication."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "The central change of this release. Every `secret` instance was keyed by a token id that does not exist until the rotation that creates it, so nothing authored beforehand could name one; findBySpec reaches the spec but returns every generation with no CEL construct for 'the newest', meaning a consumer had to guess and a wrong guess writes a REVOKED value over a live one. The `current` alias is the fix, and it is written only when a value actually came back \u2014 a rotation that returned nothing writes no alias, because a stale `current` is worse than none. Tested in all three cases."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "The workflow reads data.latest('gitlab-token','current').attributes.token for the value and .tokenId for the audit linkage, which is now a name that exists. The rotate step's predicate is unchanged. Note carried forward, not introduced here: globalArgs.tokenId still names the rotated-FROM token after a rotation, so a cross-managed instance needs its tokenId updated before the next run \u2014 the workflow will fail loudly against the revoked id rather than mis-rotate, but it will fail."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "A no-op upgrade entry targeting 2026.08.29.1. Verified rather than assumed: git diff against origin/main shows GlobalArgsSchema untouched, the only tokenScope/namespace lines in the diff being inside the secret-writing block. The entry is still required \u2014 without it existing instances stay pinned to their old typeVersion and never see update-ci-variable."
+    }
+  ]
+}

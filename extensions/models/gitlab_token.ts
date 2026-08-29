@@ -10,11 +10,13 @@
  * `tokenScope` rather than three near-identical models, so a rotation workflow
  * written against a project token works unchanged against a group token.
  *
- * Four things worth reading before use:
+ * Five things worth reading before use:
  *
  * 1. **`create` is not uniformly available, and the model says so up front.**
- *    A project or group token can be created by a Maintainer/Owner anywhere,
- *    including GitLab.com. A *personal* token cannot: self-service creation
+ *    A project or group token can be created by a Maintainer/Owner — except on
+ *    a GitLab.com *Free* namespace, where both are a paid feature and the API
+ *    refuses even an Owner with a permission error no role can satisfy. A
+ *    *personal* token cannot: self-service creation
  *    accepts only the `k8s_proxy` and `self_rotate` scopes, and creating a PAT
  *    with real scopes requires instance administrator rights on Self-Managed or
  *    Dedicated. Rather than fail deep inside an API call with GitLab's generic
@@ -30,6 +32,13 @@
  *    a self-inflicted outage, which is why the secret is a first-class resource
  *    rather than a return value.
  *
+ *    The secret is written twice: once keyed by the new token id, which is the
+ *    audit record, and once under the stable name `current`. The alias exists
+ *    because the audit key is unaddressable to a consumer — rotation mints an
+ *    id that did not exist when the consumer was written, and `findBySpec`
+ *    returns every generation with no way in CEL to ask for the newest. Read
+ *    `data.latest("<model>", "current").attributes.token`.
+ *
  * 3. **Rotation is generational, and the old token dies.** GitLab's rotate
  *    revokes the previous token immediately and issues a new id. Re-presenting
  *    the old value triggers reuse detection, which revokes the whole token
@@ -39,6 +48,14 @@
  * 4. **Revocation is idempotent.** A `delete` against an already-revoked token
  *    is success, not an error — the desired state is "gone", and a cleanup job
  *    that fails on its second run is a cleanup job nobody schedules.
+ *
+ * 5. **Rotating is only half of a handover.** `update-ci-variable` writes the
+ *    new value into a GitLab CI/CD variable, which is what turns a rotation
+ *    into a completed handover instead of a scheduled outage. It updates and
+ *    deliberately never creates: a mistyped key would otherwise become a
+ *    variable nothing reads while the real consumer kept the value that was
+ *    just revoked. It also re-asserts `masked` on every write, because GitLab
+ *    does not inherit it and an unmasked secret prints in the next job log.
  *
  * API reference: https://docs.gitlab.com/api/personal_access_tokens/
  * https://docs.gitlab.com/api/project_access_tokens/
@@ -147,6 +164,58 @@ const RevokeArgsSchema = z.object({
   ),
 });
 
+/**
+ * Arguments for writing a value into a project's CI/CD variable.
+ *
+ * This is the step that makes a rotation reach its consumer. Without it the
+ * model can revoke a token and issue a replacement while whatever reads the
+ * old value keeps reading the old value — the "rotation nobody wired up" the
+ * module docs warn about, except automated and on a schedule.
+ */
+const UpdateCiVariableArgsSchema = z.object({
+  project: z.string().min(1).describe(
+    "Project owning the variable, as a path (group/repo) or numeric ID; " +
+      "URL-encoded automatically. Deliberately separate from " +
+      "globalArgs.namespace — the project that CONSUMES a token is routinely " +
+      "not the one that owns it, and for a personal token there is no " +
+      "namespace at all.",
+  ),
+  key: z.string().min(1).describe(
+    "Name of the variable to update, e.g. GITLAB_PUSH_TOKEN.",
+  ),
+  value: z.string().min(1).meta({ sensitive: true }).describe(
+    "The value to write. SENSITIVE: vaulted by swamp, masked in logs. Wire it " +
+      "from the rotation output, e.g. " +
+      "${{ data.findBySpec('gitlab-token', 'secret').attributes.token }}.",
+  ),
+  masked: z.boolean().default(true).describe(
+    "Mask the value in job logs. Defaults true and should stay true: GitLab " +
+      "does not infer masking from the previous state, so passing false — or " +
+      "relying on a default that was false — silently UNMASKS a variable that " +
+      "was masked before, and the next pipeline prints the secret.",
+  ),
+  protected: z.boolean().default(true).describe(
+    "Expose the variable only to pipelines on protected branches and tags. " +
+      "Same reasoning as masked: this is re-asserted on every write rather " +
+      "than inherited.",
+  ),
+  environmentScope: z.string().default("*").describe(
+    "Environment scope of the variable to update. GitLab allows several " +
+      "variables to share one key across scopes, so this is what disambiguates " +
+      "them; `*` is the unscoped default.",
+  ),
+  tokenId: z.string().optional().describe(
+    "ID of the token whose value this is, recorded on the resource for audit " +
+      "linkage. Wire it from the rotate output — globalArgs.tokenId is the " +
+      "rotated-FROM id and would attribute the write to the token that was " +
+      "just revoked.",
+  ),
+  when: z.boolean().default(true).describe(
+    "Update only when true. Same rationale as the argument of the same name " +
+      "on rotate: swamp workflows cannot express predicate conditions.",
+  ),
+});
+
 /** Arguments for the list factory. */
 const ListArgsSchema = z.object({
   state: z.enum(["active", "inactive", "all"]).default("active").describe(
@@ -218,6 +287,38 @@ const SecretSchema = z.object({
   expiresAt: z.string().nullable().describe("Expiry date (YYYY-MM-DD)."),
   observedAt: z.string().describe(
     "Timestamp when this value was issued (ISO 8601).",
+  ),
+});
+
+/**
+ * Record that a rotated value reached its consumer.
+ *
+ * Deliberately carries no value — only the fact of the write and the safety
+ * flags it landed with. Its purpose is to make a CLOSED loop distinguishable
+ * from an open one: a `secret` resource proves a value was issued, and this
+ * proves something was wired to receive it. Without the pair, an inventory
+ * cannot tell a healthy rotation from one that revoked a token and stopped.
+ */
+const CiVariableSchema = z.object({
+  project: z.string().describe("Project path or ID owning the variable."),
+  key: z.string().describe("Variable name that was written."),
+  masked: z.boolean().nullable().describe(
+    "Whether GitLab reports the value as masked in job logs.",
+  ),
+  protected: z.boolean().nullable().describe(
+    "Whether the variable is restricted to protected branches and tags.",
+  ),
+  environmentScope: z.string().nullable().describe(
+    "Environment scope the written variable belongs to.",
+  ),
+  variableType: z.string().nullable().describe(
+    "GitLab variable type, env_var or file.",
+  ),
+  tokenId: z.string().nullable().describe(
+    "Token whose value was written here, when the caller supplied it.",
+  ),
+  observedAt: z.string().describe(
+    "Timestamp when the write landed (ISO 8601).",
   ),
 });
 
@@ -485,7 +586,20 @@ export const model = {
   type: "@sntxrr/gitlab-token",
   description:
     "Create, rotate, revoke and inventory GitLab personal, project and group access tokens",
-  version: "2026.08.19.1",
+  version: "2026.08.29.1",
+  // No-op by design. This release adds a method (`update-ci-variable`), a
+  // resource spec (`ci-variable`) and the `current` secret alias — none of
+  // which touch globalArguments, so there is nothing on an existing instance
+  // to transform. The entry still has to exist: without it, instances stay
+  // pinned to their old typeVersion and never see the new method.
+  upgrades: [
+    {
+      toVersion: "2026.08.29.1",
+      description:
+        "Add update-ci-variable, the ci-variable resource, and the `current` secret alias. No globalArguments change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgsSchema,
   resources: {
     "token": {
@@ -501,6 +615,13 @@ export const model = {
       schema: SecretSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
+    },
+    "ci-variable": {
+      description:
+        "Record that a rotated value was written into a project's CI/CD variable. Never the value.",
+      schema: CiVariableSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
     },
   },
   checks: {
@@ -642,16 +763,33 @@ export const model = {
         // would be worse than saying nothing, so the resource is skipped.
         const value = data.token as string | undefined;
         if (value) {
+          const secret = {
+            tokenId: newId,
+            name: resource.name,
+            tokenScope: g.tokenScope,
+            namespace: resource.namespace,
+            token: value,
+            expiresAt: resource.expiresAt,
+            observedAt,
+          };
+          handles.push(await context.writeResource("secret", newId, secret));
+          // The same value, written again under the stable name `current`.
+          //
+          // The id-keyed copy above is the audit record and must stay keyed by
+          // the real id, so a retired generation is never overwritten. But that
+          // leaves it unaddressable: both create and rotate mint an id that did
+          // not exist when the consumer was authored, so no workflow can name
+          // the instance ahead of time, and `findBySpec` hands back every
+          // generation with no way in CEL to say "the newest one". A consumer
+          // would be guessing, and guessing wrong means writing a REVOKED value
+          // over a live one.
+          //
+          // `current` is that missing handle — always the value issued most
+          // recently, so `data.latest("<model>", "current").attributes.token`
+          // resolves for a consumer written long before this rotation ran. Same
+          // convention as @sntxrr/credential-expiry's `audit` summary.
           handles.push(
-            await context.writeResource("secret", newId, {
-              tokenId: newId,
-              name: resource.name,
-              tokenScope: g.tokenScope,
-              namespace: resource.namespace,
-              token: value,
-              expiresAt: resource.expiresAt,
-              observedAt,
-            }),
+            await context.writeResource("secret", "current", secret),
           );
         } else {
           logger.warn(
@@ -718,16 +856,33 @@ export const model = {
 
         const value = data.token as string | undefined;
         if (value) {
+          const secret = {
+            tokenId: newId,
+            name: resource.name,
+            tokenScope: g.tokenScope,
+            namespace: resource.namespace,
+            token: value,
+            expiresAt: resource.expiresAt,
+            observedAt,
+          };
+          handles.push(await context.writeResource("secret", newId, secret));
+          // The same value, written again under the stable name `current`.
+          //
+          // The id-keyed copy above is the audit record and must stay keyed by
+          // the real id, so a retired generation is never overwritten. But that
+          // leaves it unaddressable: both create and rotate mint an id that did
+          // not exist when the consumer was authored, so no workflow can name
+          // the instance ahead of time, and `findBySpec` hands back every
+          // generation with no way in CEL to say "the newest one". A consumer
+          // would be guessing, and guessing wrong means writing a REVOKED value
+          // over a live one.
+          //
+          // `current` is that missing handle — always the value issued most
+          // recently, so `data.latest("<model>", "current").attributes.token`
+          // resolves for a consumer written long before this rotation ran. Same
+          // convention as @sntxrr/credential-expiry's `audit` summary.
           handles.push(
-            await context.writeResource("secret", newId, {
-              tokenId: newId,
-              name: resource.name,
-              tokenScope: g.tokenScope,
-              namespace: resource.namespace,
-              token: value,
-              expiresAt: resource.expiresAt,
-              observedAt,
-            }),
+            await context.writeResource("secret", "current", secret),
           );
         } else {
           // The old token is already dead at this point, so a missing value is
@@ -744,6 +899,153 @@ export const model = {
           { old: tokenId, new: newId },
         );
         return { dataHandles: handles };
+      },
+    },
+    "update-ci-variable": {
+      description:
+        "Write a value into a project's CI/CD variable — the step that carries a rotation through to its consumer.",
+      arguments: UpdateCiVariableArgsSchema,
+      execute: async (
+        args: z.infer<typeof UpdateCiVariableArgsSchema>,
+        context: ExecuteContext,
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        const { globalArgs: g, logger } = context;
+
+        // Same contract as rotate and delete: a false predicate costs nothing
+        // and writes nothing, so the existing record stays true rather than
+        // gaining a write that never happened.
+        if (!args.when) {
+          logger.info(
+            "Condition was false; not updating CI variable {key} on {project}",
+            { key: args.key, project: args.project },
+          );
+          return { dataHandles: [] };
+        }
+
+        const path = `/projects/${encodeURIComponent(args.project)}/variables/${
+          encodeURIComponent(args.key)
+        }?filter[environment_scope]=${
+          encodeURIComponent(args.environmentScope)
+        }`;
+
+        logger.info(
+          "Updating CI variable {key} on project {project} (scope {scope})",
+          {
+            key: args.key,
+            project: args.project,
+            scope: args.environmentScope,
+          },
+        );
+
+        let data: Record<string, unknown>;
+        try {
+          ({ data } = await gitlabFetch<Record<string, unknown>>(
+            g,
+            "PUT",
+            path,
+            {
+              value: args.value,
+              masked: args.masked,
+              protected: args.protected,
+              environment_scope: args.environmentScope,
+            },
+          ));
+        } catch (e) {
+          const status = (e as { status?: number }).status;
+          // Update, never upsert. Creating a missing variable would turn a
+          // mistyped key into a brand-new variable nothing reads, while the
+          // real consumer went on reading the value that was just revoked —
+          // a silent outage wearing a green run. Refuse and name both halves.
+          if (status === 404) {
+            throw new Error(
+              `CI/CD variable "${args.key}" was not found on project ` +
+                `"${args.project}" at environment scope ` +
+                `"${args.environmentScope}". This method updates an existing ` +
+                `variable and deliberately will not create one: a mistyped key ` +
+                `would be created as a variable nothing reads, while the real ` +
+                `consumer kept reading the value this rotation just revoked. ` +
+                `Create the variable once by hand, then let rotation maintain it.`,
+            );
+          }
+          // GitLab rejects a masked value that fails its masking rules, and the
+          // raw 400 does not say so. Name the likely cause rather than leaving
+          // an operator to guess at a rejected rotation.
+          if (status === 400 && args.masked) {
+            throw new Error(
+              `GitLab rejected the update of "${args.key}" on ` +
+                `"${args.project}" with 400 while masked=true. GitLab refuses ` +
+                `to mask a value that breaks its masking rules — single line, ` +
+                `at least 8 characters, and a restricted character set. The ` +
+                `value was NOT written. Original error: ${
+                  (e as Error).message
+                }`,
+            );
+          }
+          throw e;
+        }
+
+        const observedAt = new Date().toISOString();
+        const landedMasked = typeof data.masked === "boolean"
+          ? data.masked
+          : null;
+
+        // Written before the masking assertion below, so the audit trail
+        // records what actually happened even on the path that then fails.
+        const handle = await context.writeResource(
+          "ci-variable",
+          `${args.project}:${args.key}`.replace(/[^A-Za-z0-9._-]+/g, "-"),
+          {
+            project: args.project,
+            key: args.key,
+            masked: landedMasked,
+            protected: typeof data.protected === "boolean"
+              ? data.protected
+              : null,
+            environmentScope: typeof data.environment_scope === "string"
+              ? data.environment_scope
+              : null,
+            variableType: typeof data.variable_type === "string"
+              ? data.variable_type
+              : null,
+            tokenId: args.tokenId ?? null,
+            observedAt,
+          },
+        );
+
+        // Masking was requested but GitLab said nothing about it. Not provable
+        // either way, so this cannot fail the run — but it must not read as
+        // confirmation either, because the caller asked for masking and has no
+        // other signal that it held.
+        if (args.masked && landedMasked === null) {
+          logger.warn(
+            "GitLab did not report a masked flag for {key} on {project}; " +
+              "masking was requested but is UNCONFIRMED — verify it by hand",
+            { key: args.key, project: args.project },
+          );
+        }
+
+        // Masking was requested and did not land. The value is already stored
+        // and the next pipeline would print it, so this is an incident, not a
+        // warning — fail the run and let the alert fire.
+        if (args.masked && landedMasked === false) {
+          throw new Error(
+            `CI/CD variable "${args.key}" on "${args.project}" was written but ` +
+              `GitLab reports it as UNMASKED despite masked=true being ` +
+              `requested. The value is live and will be printed in job logs. ` +
+              `Mask or replace it now.`,
+          );
+        }
+
+        logger.info(
+          "Updated CI variable {key} on {project} (masked={masked}, protected={protected})",
+          {
+            key: args.key,
+            project: args.project,
+            masked: landedMasked,
+            protected: data.protected,
+          },
+        );
+        return { dataHandles: [handle] };
       },
     },
     delete: {
