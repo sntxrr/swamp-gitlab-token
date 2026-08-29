@@ -1,7 +1,7 @@
 {
   "extension": "@sntxrr/gitlab-token",
   "version": "2026.08.29.2",
-  "reviewedAt": "2026-08-29T22:21:00Z",
+  "reviewedAt": "2026-08-29T22:30:00Z",
   "dimensions": [
     {
       "id": "credentials-secrets",
@@ -31,7 +31,7 @@
     {
       "id": "api-contracts",
       "verdict": "pass",
-      "note": "No GitLab API surface changed. One swamp contract is now honoured rather than abused: an extension may ship a workflow, but scheduling it is the host operator's decision. The README shows `swamp workflow trigger set` for hosts that want the author's cadence."
+      "note": "No GitLab API surface changed. One swamp contract is now honoured rather than abused: an extension may ship a workflow, but scheduling it is the host operator's decision. The README shows `swamp workflow trigger set` for hosts that want the author's cadence. One CLI inconsistency found while verifying the documented commands and recorded in the README rather than left as a trap: `swamp workflow run --input rotateWithinDays=14` coerces the string against the declared type, but `swamp workflow evaluate` rejects the same form with `must be an integer` and requires JSON. The scheduled path uses `run`, so the documented form is correct \u2014 but a reader who reaches for `evaluate` to debug their expressions would hit a confusing error."
     },
     {
       "id": "resource-management",
@@ -41,7 +41,7 @@
     {
       "id": "published-surface-hygiene",
       "verdict": "pass",
-      "note": "The headline fix, and a second one in the same place as last release. `2026.08.29.1` shipped a `trigger:` in its workflow, so installing the extension registered a daily 06:40 job on every host \u2014 at a time this author picked, against whatever instance matched the hardcoded name `gitlab-token`. On the first host to install it, that instance existed and was managing a production token, and the vendored job landed ten minutes before the operator's own schedule. Worse, the job it registered was the one whose propagate step dies on evaluation, so it would have failed daily with no alert, since the shipped workflow has no notification. Removing the trigger is the fix; the README now says why, and a test asserts it. Pattern worth naming: for two consecutive releases the defect was in the workflow file rather than the model, and both times every model-level signal was green."
+      "note": "The headline fix, and a second one in the same place as last release. `2026.08.29.1` shipped a `trigger:` in its workflow, so installing the extension registered a daily 06:40 job on every host \u2014 at a time this author picked, against whatever instance matched the hardcoded name `gitlab-token`. On the first host to install it, that instance existed and was managing a production token, and the vendored job landed ten minutes before the operator's own schedule. Worse, the job it registered was the one whose propagate step dies on evaluation, so it would have failed daily with no alert, since the shipped workflow has no notification. Removing the trigger is the fix; the README now says why, and a test asserts it. Pattern worth naming: for two consecutive releases the defect was in the workflow file rather than the model, and both times every model-level signal was green. Re-reviewed after the scheduling documentation was expanded, which is the half of this change that decides whether removing the trigger helps or merely shifts the failure. Dropping a built-in schedule without telling people how to set one turns an unwanted job into no job at all, which is the quieter failure of the two. The README now carries a `Scheduling it` section with the full `swamp workflow trigger set` invocation INCLUDING its inputs, a `trigger get` to confirm it took, the `remove` to undo it, and a table naming what goes wrong when only some inputs are passed: schedule alone leaves `rotate` false so the job checks forever and never rotates, while `rotate=true` without the CI-variable inputs rotates and skips the handover. Every command in that section was run before it was written; `trigger get` after `remove` reporting `schedule: (none)` is also the positive proof that the built-in trigger is genuinely gone."
     },
     {
       "id": "schema-strictness",
