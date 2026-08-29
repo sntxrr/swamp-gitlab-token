@@ -203,8 +203,11 @@ const UpdateCiVariableArgsSchema = z.object({
   ),
   value: z.string().min(1).meta({ sensitive: true }).describe(
     "The value to write. SENSITIVE: vaulted by swamp, masked in logs. Wire it " +
-      "from the rotation output, e.g. " +
-      "${{ data.findBySpec('gitlab-token', 'secret').attributes.token }}.",
+      "from the rotation output via the stable alias, e.g. " +
+      "${{ data.latest('gitlab-token', 'current').attributes.token }}. NOT " +
+      "findBySpec over the secret spec: that returns every generation with no " +
+      "way to ask for the newest, so it can write a REVOKED value over a live " +
+      "one.",
   ),
   masked: z.boolean().default(true).describe(
     "Mask the value in job logs. Defaults true and should stay true: GitLab " +

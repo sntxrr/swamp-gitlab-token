@@ -251,9 +251,10 @@ cleanup job that fails on its second run is one nobody schedules.
 
 ## The rotation workflow
 
-The extension ships `@sntxrr/gitlab-token-rotation`, a two-job workflow that
-checks the managed token daily and rotates it only when told to *and* only when
-it is genuinely close to lapsing.
+The extension ships `@sntxrr/gitlab-token-rotation`, a three-job workflow —
+**check → rotate → propagate** — that reads the managed token's expiry daily,
+rotates it only when told to *and* only when it is genuinely close to lapsing,
+and then writes the replacement through to the CI/CD variable that consumes it.
 
 ```bash
 # scheduled path — read-only, keeps daysRemaining current
@@ -283,13 +284,35 @@ predicate over another step's output. A false `when` costs nothing — `rotate`
 returns before it touches the API and writes no resource, so the existing
 snapshot stays true instead of gaining a generation that was never issued.
 
-The predicate uses `data.findBySpec` rather than `data.latest` because this
-model keys each snapshot by the token's real GitLab ID, so the instance name is
-not knowable when the workflow file is written.
+The threshold predicate reads the `managed` alias, **not** `findBySpec`. This
+model keys each snapshot by the token's real GitLab ID so a retired generation
+is never overwritten, which means `findBySpec` returns *every* generation —
+including the one just rotated away, sitting at zero days remaining forever. An
+`exists` over that stays true permanently once any token has neared expiry, so a
+workflow gated on it would rotate again on every subsequent run. `managed` holds
+only the generation in play, so the predicate goes false the moment a fresh
+token is issued.
 
 **Wire the consumer before enabling rotation.** The replacement value lands in
 the `secret` resource and nowhere else. A rotation whose output nothing reads is
 an outage you scheduled.
+
+### A workflow file needs an `id`, and says nothing when it lacks one
+
+Swamp's extension workflow repository requires a top-level UUID `id`. A file
+without one is dropped at load with a single `Skipping broken extension
+workflow` warning — the extension still packages, still publishes, still scores
+100%, and the workflow is simply absent from every install. `swamp workflow
+list` omits it and `swamp workflow run` answers `Workflow not found` for a file
+sitting in the repo.
+
+`2026.08.19.2` shipped exactly that. If you fork this extension or add a second
+workflow, assert the field in a test rather than trusting the publish to catch
+it — nothing in the build path does:
+
+```bash
+swamp workflow list | grep gitlab-token-rotation   # empty means it did not load
+```
 
 ## Global arguments
 

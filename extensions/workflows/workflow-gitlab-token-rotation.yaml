@@ -1,3 +1,17 @@
+# Required, and its absence is silent. A workflow file without an `id` is not
+# rejected at load — the extension workflow repository logs one "Skipping broken
+# extension workflow" warning and drops it, so `swamp workflow list` omits it
+# entirely and `swamp workflow run` answers "Workflow not found", naming a
+# workflow that is sitting right there in the repo.
+# The extension still packages, publishes and scores 100%, because the manifest
+# only records that a workflow file exists, not that it parses. That is how
+# 2026.08.19.2 shipped a rotation workflow that could never be run.
+#
+# The id is fixed rather than generated per install: it identifies THIS
+# workflow the way the name does, and run history attaches to the workflow
+# (`swamp workflow delete` removes "a workflow and its run history"), so an id
+# that changed on every pull would fragment that history across installs.
+id: ec6eda6a-da94-4f00-8671-349695c7ebc7
 name: "@sntxrr/gitlab-token-rotation"
 description: >-
   Keep one GitLab access token ahead of its own expiry: check what it has left

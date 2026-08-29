@@ -11,6 +11,7 @@ import {
   assertRejects,
   assertStringIncludes,
 } from "jsr:@std/assert@1";
+import { parse } from "jsr:@std/yaml@1";
 import {
   collectionPath,
   createPath,
@@ -1124,4 +1125,53 @@ Deno.test("valid-target rejects tokenId and tokenName set together", () => {
   });
   assert(!r.pass);
   assertStringIncludes(r.errors!.join(" "), "Set exactly");
+});
+
+// The workflow file itself. Not a unit test of the model, but it guards the
+// exact regression that shipped in 2026.08.19.2: a workflow missing its `id`
+// is dropped by the extension workflow repository with a single warning, and
+// nothing downstream fails — the extension packages, publishes and scores
+// 100%, and the workflow is simply absent from every install. Only an
+// assertion over the file catches it, because no build step does.
+Deno.test("shipped workflow declares a top-level UUID id, or it never loads", async () => {
+  const path = new URL(
+    "../workflows/workflow-gitlab-token-rotation.yaml",
+    import.meta.url,
+  );
+  const doc = parse(await Deno.readTextFile(path)) as Record<string, unknown>;
+
+  assertEquals(typeof doc.id, "string");
+  assert(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+      String(doc.id),
+    ),
+    `workflow id must be a lowercase UUID, got ${JSON.stringify(doc.id)}`,
+  );
+  // Name and jobs travel with it: a file that loses either is equally invisible.
+  assertEquals(doc.name, "@sntxrr/gitlab-token-rotation");
+  assert(Array.isArray(doc.jobs) && doc.jobs.length > 0, "workflow has jobs");
+});
+
+// The propagate job is what makes rotation a handover rather than an outage,
+// and it is only reachable if it depends on the job that produces the value.
+Deno.test("propagate job runs only after a succeeded rotate", async () => {
+  const path = new URL(
+    "../workflows/workflow-gitlab-token-rotation.yaml",
+    import.meta.url,
+  );
+  const doc = parse(await Deno.readTextFile(path)) as {
+    jobs: Array<Record<string, unknown>>;
+  };
+  const propagate = doc.jobs.find((j) => j.name === "propagate");
+  assert(propagate, "propagate job exists");
+  assertEquals(propagate.dependsOn, [
+    { job: "rotate", condition: { type: "succeeded" } },
+  ]);
+
+  // allowFailure lives on the step, not the job. It must stay false: by the
+  // time this step runs the outgoing token is already revoked, so a swallowed
+  // failure reports a green run over a consumer holding a dead credential.
+  const steps = propagate.steps as Array<Record<string, unknown>>;
+  assertEquals(steps.length, 1);
+  assertEquals(steps[0].allowFailure, false);
 });
