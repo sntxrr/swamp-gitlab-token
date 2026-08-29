@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/gitlab-token",
+  "version": "2026.08.29.3",
+  "reviewedAt": "2026-08-29T22:53:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "No credential path changed. The check reads identifiers only and never the token. Worth noting that `RawGlobalArgs` deliberately leaves `token` required rather than optional: a check that ran happily without one would be asserting things about an instance that cannot authenticate, and the 13 known `credentials-sensitive-field` false positives are unchanged."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "No logging changed. The improvement is in what the check SAYS: previously an instance that took every default was told `tokenScope \"undefined\" requires namespace`, which names a field the operator never set and prescribes a fix that trips a different error. Errors now describe real faults only."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "The bug class here is a check that reports a fault where none exists \u2014 a false positive in a preflight, which is worse than it sounds because a preflight that cries wolf gets configured around. The circular pair was the sharp end: following the first message produced the second. Both are gone, and a test asserts the minimal instance yields an EMPTY error list rather than merely `pass: true`, so a future regression that passes while still complaining is caught."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "66 tests, four new, and the important property is what they do NOT do: they never spread the `G` fixture. Every pre-existing valid-target test spreads it, and `G` supplies `baseUrl` and `tokenScope` by hand \u2014 which is exactly why four releases of this check passed a green suite while failing the minimal real instance. The new tests pass raw objects, as swamp does. One asserts the schema's parsed defaults ARE the exported constants, so changing a default in the schema cannot leave the check comparing a stale literal; that is the fix's actual invariant rather than a restatement of it."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "na",
+      "note": "The check is pure and side-effect free; this release does not change that."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "The contract clarified is with swamp, not GitLab: a check executes against the instance's RAW configuration, before schema defaults are applied. That was previously assumed rather than known, and the parameter type asserted the opposite. It is now modelled in `RawGlobalArgs`, so the compiler enforces a `??` at each read."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "na",
+      "note": "No spec, instance, alias, lifetime or GC change."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Three new exported symbols, each with its own doc comment \u2014 a shared block above the group scored 0/1 on `symbols-docs` and dropped the extension to 91%, caught before push. The README's Pre-flight section now states that the check reads the instance as written, describes the circular failure concretely, and tells anyone who wrote `baseUrl` out as a workaround that they may keep or drop it. It also gains the `tokenId`/`tokenName` rejection, which the check has done since 2026.08.29.1 and the README never listed."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "No schema shape changed. Three inline default literals became named constants \u2014 `DEFAULT_BASE_URL`, `DEFAULT_TOKEN_SCOPE`, `DEFAULT_TIMEOUT_MS` \u2014 used by both the schema and the check, so the two cannot drift apart. `timeoutMs` gets a constant for consistency even though no check reads it; leaving one of three inline invites the next reader to inline the others back."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "na",
+      "note": "Untouched. The long-standing open note on whether swamp counts versions per instance or across a spec carries forward, still unverified."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Verb set unchanged."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "The dimension this release exists for, and it closes the ISSUE recorded against 2026.08.29.2 rather than carrying it a third time. Verified by execution, not inspection: a raw `{ token }` config that previously produced two errors now produces none, while `{ token, tokenScope: 'project' }` still produces exactly one and a malformed supplied baseUrl still produces its own. The known limitation is unchanged and still recorded \u2014 swamp fires checks only on create/update/delete/action-named methods, so neither `sync` nor `update-ci-variable` gets a preflight, which is why the tokenId/tokenName rule is ALSO enforced inside resolveTokenId."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "na",
+      "note": "No instance or alias name changed."
+    },
+    {
+      "id": "data-access",
+      "verdict": "na",
+      "note": "No CEL expression or resource read changed. The workflow is untouched by this release."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.08.29.3, third consecutive no-op upgrade entry, and its description carries the operationally useful part: an instance that wrote `baseUrl` or `tokenScope` out explicitly to work around the broken check may now drop them or keep them, both correct. The model's `version` was bumped alongside the manifest's \u2014 a mismatch is rejected as an upgrade-chain error, which caught the omission on the previous release before any push."
+    }
+  ]
+}

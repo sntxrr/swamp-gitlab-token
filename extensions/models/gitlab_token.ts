@@ -96,6 +96,25 @@ export const ACCESS_LEVELS = {
 } as const;
 export type AccessLevelName = keyof typeof ACCESS_LEVELS;
 
+// --- Defaults ---------------------------------------------------------------
+/**
+ * Defaults for the globals that have one, named rather than inlined.
+ *
+ * They are constants because TWO places need them and only one of those gets
+ * them from zod. A `swamp` check runs against the instance's RAW configuration
+ * — the YAML as written, before the schema is applied — so a defaulted field
+ * an operator omitted arrives at the check as `undefined`, whatever the parsed
+ * type claims. Writing the literal into `.default()` and trusting the check to
+ * see it is how 2026.08.29.2 shipped a `valid-target` that failed the minimal
+ * valid instance.
+ */
+/** Default GitLab instance root. Override only for self-managed. */
+export const DEFAULT_BASE_URL = "https://gitlab.com";
+/** Default token family — personal, the only kind GitLab.com Free offers. */
+export const DEFAULT_TOKEN_SCOPE = "personal" as const;
+/** Default per-request timeout, in milliseconds. */
+export const DEFAULT_TIMEOUT_MS = 15000;
+
 // --- Schemas ---------------------------------------------------------------
 /** Global arguments shared by every method on the token model. */
 const GlobalArgsSchema = z.object({
@@ -103,10 +122,10 @@ const GlobalArgsSchema = z.object({
     "GitLab token used to authenticate these API calls, sent as PRIVATE-TOKEN. " +
       "Needs `api` scope. Wire with ${{ vault.get(gitlab, TOKEN) }} — never inline.",
   ),
-  baseUrl: z.string().default("https://gitlab.com").describe(
+  baseUrl: z.string().default(DEFAULT_BASE_URL).describe(
     "GitLab instance base URL, without the /api/v4 suffix. Override for self-managed.",
   ),
-  tokenScope: z.enum(TOKEN_SCOPES).default("personal").describe(
+  tokenScope: z.enum(TOKEN_SCOPES).default(DEFAULT_TOKEN_SCOPE).describe(
     "Which token family this instance manages: personal, project, or group.",
   ),
   namespace: z.string().optional().describe(
@@ -133,11 +152,24 @@ const GlobalArgsSchema = z.object({
       "administrator rights. Omit to create a token for the authenticated " +
       "user, which GitLab restricts to the k8s_proxy and self_rotate scopes.",
   ),
-  timeoutMs: z.number().int().positive().default(15000).describe(
+  timeoutMs: z.number().int().positive().default(DEFAULT_TIMEOUT_MS).describe(
     "Abort any single API request after this long.",
   ),
 });
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
+
+/**
+ * Global arguments as a CHECK receives them: defaulted fields may be missing.
+ *
+ * swamp evaluates a check against the instance YAML as written, so anything
+ * with a `.default()` in the schema is `undefined` unless the operator spelled
+ * it out. Modelling that in the type is the point — it makes the compiler
+ * insist on a `??` at every read rather than letting the check quietly compare
+ * `undefined` against a literal.
+ */
+export type RawGlobalArgs =
+  & Omit<GlobalArgs, "baseUrl" | "tokenScope" | "timeoutMs">
+  & Partial<Pick<GlobalArgs, "baseUrl" | "tokenScope" | "timeoutMs">>;
 
 /** Arguments for provisioning a new token. */
 const CreateArgsSchema = z.object({
@@ -710,7 +742,7 @@ export const model = {
   type: "@sntxrr/gitlab-token",
   description:
     "Create, rotate, revoke and inventory GitLab personal, project and group access tokens",
-  version: "2026.08.29.2",
+  version: "2026.08.29.3",
   // Both entries are no-ops, and each has to exist anyway: without one, an
   // instance stays pinned to its old typeVersion and never sees the release.
   //
@@ -746,6 +778,12 @@ export const model = {
         "Workflow only: drop the built-in schedule, fix the propagate predicate, safe-navigate its inputs. No model change, so nothing to migrate — but re-read the workflow if you vendored a copy.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.08.29.3",
+      description:
+        "Fix valid-target, which failed any instance that relied on a documented default. Nothing to migrate — and an instance that wrote baseUrl or tokenScope out explicitly to work around it can now drop them, or keep them; both are correct.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   globalArguments: GlobalArgsSchema,
   resources: {
@@ -777,9 +815,28 @@ export const model = {
         "Ensure the configured scope, namespace and base URL address a real collection before anything is mutated.",
       labels: ["policy"],
       execute: (
-        context: { globalArgs: GlobalArgs },
+        // NOT GlobalArgs. A check runs against the instance's raw configuration
+        // before the schema is applied, so every defaulted field may be absent
+        // here. Typing this parameter as the parsed type was a lie the compiler
+        // could not catch, and it is what broke this check: an instance that
+        // set only `token` — the minimal valid config, relying entirely on
+        // documented defaults — failed its own preflight with TWO errors, one
+        // of which sent the operator in a circle. "tokenScope \"undefined\"
+        // requires namespace" tells you to set a namespace; doing so then trips
+        // "namespace is set but tokenScope is personal". Neither message is
+        // about the real problem, because the real problem is that neither
+        // field was read.
+        context: { globalArgs: RawGlobalArgs },
       ): { pass: boolean; errors?: string[] } => {
-        const g = context.globalArgs;
+        const raw = context.globalArgs;
+        // Resolve the defaults ONCE, here, from the same constants the schema
+        // uses. Everything below then reads a value that is present whether or
+        // not the operator wrote it down.
+        const g = {
+          ...raw,
+          baseUrl: raw.baseUrl ?? DEFAULT_BASE_URL,
+          tokenScope: raw.tokenScope ?? DEFAULT_TOKEN_SCOPE,
+        };
         const errors: string[] = [];
         if (g.tokenScope !== "personal" && !g.namespace) {
           errors.push(
@@ -1334,4 +1391,8 @@ export const _internal = {
   requireTokenId,
   resolveTokenId,
   MANAGED_ALIAS,
+  // Exported so a test can assert the schema's defaults ARE the named
+  // constants the check reads, rather than two literals that happen to agree
+  // today. That agreement is the whole fix.
+  GlobalArgsSchema,
 };
