@@ -72,8 +72,10 @@ There is no read path that returns it. So both methods write two resources:
   reference, so the plaintext never lands in the datastore and never reaches a
   log.
 
-The secret is written **twice**: once keyed by the new token ID, which is the
-audit record, and once under the stable name `current`. Wire a consumer to the
+The secret is written **twice**: once as `secret-<new token ID>`, which is the
+audit record, and once under the stable name `current`. The audit copy carries
+the `secret-` prefix because the `token` snapshot already uses the bare ID, and
+swamp refuses one instance name written twice in a run. Wire a consumer to the
 alias:
 
 ```
@@ -333,7 +335,8 @@ warning.
 | --- | --- | --- |
 | `rotate` | `false` | Permit rotation at all. The default makes the scheduled run read-only. |
 | `rotateWithinDays` | `7` | Rotate only at or below this many days remaining. |
-| `expiresAt` | `""` | Expiry for the replacement, `YYYY-MM-DD`. Empty takes GitLab's default. |
+| `expiresAt` | `""` | Expiry for the replacement, `YYYY-MM-DD`. Empty uses `expiresInDays`. |
+| `expiresInDays` | `90` | Expiry as days from the rotation, when `expiresAt` is empty. Keep it above `rotateWithinDays`, or every run rotates. |
 | `ciVariableProject` | `""` | Project whose CI/CD variable consumes the token. Empty skips propagation. |
 | `ciVariableKey` | `""` | Variable to update with the rotated value. Empty skips propagation. |
 

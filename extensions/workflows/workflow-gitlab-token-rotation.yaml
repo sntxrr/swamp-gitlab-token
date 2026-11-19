@@ -86,10 +86,18 @@ inputs:
     expiresAt:
       type: string
       description: >-
-        Expiry for the replacement token, as YYYY-MM-DD. Leave empty to take
-        GitLab's default, which is one week where an expiry is mandatory and
-        the instance maximum otherwise.
+        Expiry for the replacement token, as YYYY-MM-DD. Leave empty to use
+        `expiresInDays`.
       default: ""
+    expiresInDays:
+      type: integer
+      description: >-
+        Expiry for the replacement token as days from the day of rotation, used
+        when `expiresAt` is empty. Must be larger than `rotateWithinDays`.
+        GitLab's own default on rotate is one week where an expiry is
+        mandatory, which is inside the default threshold: a rotation that took
+        it would be followed by another rotation on every later run.
+      default: 90
     ciVariableProject:
       type: string
       description: >-
@@ -163,6 +171,7 @@ jobs:
           methodName: rotate
           inputs:
             expiresAt: ${{ inputs.expiresAt }}
+            expiresInDays: ${{ inputs.expiresInDays }}
             when: >-
               ${{ inputs.rotate &&
               data.latest('gitlab-token', 'managed').?attributes.?daysRemaining.orValue(99999)

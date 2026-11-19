@@ -15,14 +15,16 @@ import { parse } from "jsr:@std/yaml@1";
 import {
   _internal,
   collectionPath,
+  createPath,
+  daysUntil,
   DEFAULT_BASE_URL,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_TOKEN_SCOPE,
-  createPath,
-  daysUntil,
   model,
-  toTokenResource,
+  resolveExpiry,
+  secretName,
   tokenPath,
+  toTokenResource,
 } from "./gitlab_token.ts";
 
 const G = {
@@ -49,6 +51,10 @@ function makeContext(globalArgs: Record<string, unknown> = G): {
   const writes: Array<
     { spec: string; name: string; data: Record<string, unknown> }
   > = [];
+  // swamp refuses one instance name written twice in a run, across specs as
+  // well as within one, and only after the method's API calls have landed. A
+  // fake that accepts a repeat hides exactly that failure.
+  const seen = new Map<string, string>();
   const logs: string[] = [];
   const record = (message: string, props?: Record<string, unknown>) => {
     logs.push(message + " " + JSON.stringify(props ?? {}));
@@ -61,6 +67,15 @@ function makeContext(globalArgs: Record<string, unknown> = G): {
       name: string,
       data: Record<string, unknown>,
     ) => {
+      const earlier = seen.get(name);
+      if (earlier !== undefined) {
+        return Promise.reject(
+          new Error(
+            `Duplicate data instance name '${name}' (already written as resource '${earlier}' in this run)`,
+          ),
+        );
+      }
+      seen.set(name, spec);
       writes.push({ spec, name, data });
       return Promise.resolve({ name });
     },
@@ -198,7 +213,12 @@ Deno.test("toTokenResource maps GitLab fields and never carries a token value", 
 
 Deno.test("a personal token reports no namespace even if one is configured", () => {
   const now = new Date("2026-08-19T00:00:00Z");
-  const resource = toTokenResource({ id: 1 }, G as never, now.toISOString(), now);
+  const resource = toTokenResource(
+    { id: 1 },
+    G as never,
+    now.toISOString(),
+    now,
+  );
   assertEquals(resource.namespace, null);
 });
 
@@ -246,7 +266,7 @@ Deno.test("sync without a tokenId fails with an actionable message", async () =>
   await assertRejects(
     () => model.methods.sync.execute({}, ctx),
     Error,
-    'requires globalArgs.tokenId',
+    "requires globalArgs.tokenId",
   );
 });
 
@@ -292,7 +312,7 @@ Deno.test("create posts scopes and access_level, and vaults the value separately
   const meta = writes.find((w) => w.spec === "token")!;
   const secret = writes.find((w) => w.spec === "secret")!;
   assertEquals(meta.name, "77");
-  assertEquals(secret.name, "77");
+  assertEquals(secret.name, "secret-77");
   assertEquals(secret.data.token, "glpat-brand-new-value");
   assert(
     !JSON.stringify(meta.data).includes("glpat-brand-new-value"),
@@ -401,7 +421,7 @@ Deno.test("rotate keys the snapshot by the NEW id, not the rotated-from id", asy
   );
   assertStringIncludes(url, "/personal_access_tokens/42/rotate");
   assertEquals(writes.find((w) => w.spec === "token")!.name, "99");
-  assertEquals(writes.find((w) => w.spec === "secret")!.name, "99");
+  assertEquals(writes.find((w) => w.spec === "secret")!.name, "secret-99");
 });
 
 Deno.test("rotate passes expires_at through when given", async () => {
@@ -414,7 +434,11 @@ Deno.test("rotate passes expires_at through when given", async () => {
         status: 200,
       });
     },
-    () => model.methods.rotate.execute({ expiresAt: "2026-12-01", when: true }, ctx),
+    () =>
+      model.methods.rotate.execute(
+        { expiresAt: "2026-12-01", when: true },
+        ctx,
+      ),
   );
   assertEquals(body.expires_at, "2026-12-01");
 });
@@ -510,7 +534,10 @@ Deno.test("list forwards its filters and drops state=all", async () => {
   await withMockedFetch(
     (u) => {
       url = u;
-      return new Response("[]", { status: 200, headers: { "x-next-page": "" } });
+      return new Response("[]", {
+        status: 200,
+        headers: { "x-next-page": "" },
+      });
     },
     () =>
       model.methods.list.execute(
@@ -765,7 +792,10 @@ Deno.test("update-ci-variable PUTs the encoded project and the scope filter", as
     () => model.methods["update-ci-variable"].execute(CI_ARGS, ctx),
   );
   assertEquals(method, "PUT");
-  assertStringIncludes(url, "/projects/group%2Frepo/variables/GITLAB_PUSH_TOKEN");
+  assertStringIncludes(
+    url,
+    "/projects/group%2Frepo/variables/GITLAB_PUSH_TOKEN",
+  );
   assertStringIncludes(url, "filter[environment_scope]=*");
   assertEquals(body.value, "glpat-rotated-value");
   assertEquals(body.masked, true);
@@ -877,7 +907,10 @@ Deno.test("rotate also writes the secret under the stable name current", async (
   );
   const secrets = writes.filter((w) => w.spec === "secret");
   assertEquals(secrets.length, 2);
-  assert(secrets.some((s) => s.name === "99"), "id-keyed audit copy missing");
+  assert(
+    secrets.some((s) => s.name === "secret-99"),
+    "id-keyed audit copy missing",
+  );
   assert(secrets.some((s) => s.name === "current"), "current alias missing");
   // Both must carry the same value, or the alias points at a different secret.
   assertEquals(secrets[0].data.token, secrets[1].data.token);
@@ -911,7 +944,8 @@ Deno.test("a rotation that returns no value writes no current alias", async () =
   // value over a live one and report success.
   const { ctx, writes } = makeContext(G);
   await withMockedFetch(
-    () => new Response(JSON.stringify({ id: 99, name: "deploy" }), { status: 200 }),
+    () =>
+      new Response(JSON.stringify({ id: 99, name: "deploy" }), { status: 200 }),
     () => model.methods.rotate.execute({ when: true }, ctx),
   );
   assertEquals(writes.filter((w) => w.spec === "secret").length, 0);
@@ -1081,12 +1115,19 @@ Deno.test("the managed alias tracks the generation in play, so a threshold goes 
   await withMockedFetch(
     () =>
       new Response(
-        JSON.stringify({ id: 99, name: "d", token: "glpat-x", expires_at: "2027-01-01" }),
+        JSON.stringify({
+          id: 99,
+          name: "d",
+          token: "glpat-x",
+          expires_at: "2027-01-01",
+        }),
         { status: 200 },
       ),
     () => model.methods.rotate.execute({ when: true }, ctx),
   );
-  const managed = writes.find((w) => w.spec === "token" && w.name === "managed")!;
+  const managed = writes.find((w) =>
+    w.spec === "token" && w.name === "managed"
+  )!;
   assertEquals(managed.data.id, "99");
 });
 
@@ -1098,14 +1139,24 @@ Deno.test("the two aliases never share an instance name", async () => {
   const { ctx, writes } = makeContext(G);
   await withMockedFetch(
     () =>
-      new Response(JSON.stringify({ id: 99, token: "glpat-x" }), { status: 200 }),
+      new Response(JSON.stringify({ id: 99, token: "glpat-x" }), {
+        status: 200,
+      }),
     () => model.methods.rotate.execute({ when: true }, ctx),
   );
   const aliases = writes.filter((w) => !/^[0-9]+$/.test(w.name));
   const names = new Set(aliases.map((w) => `${w.spec}:${w.name}`));
-  assertEquals(names.size, aliases.length, "alias names must be unique per spec");
+  assertEquals(
+    names.size,
+    aliases.length,
+    "alias names must be unique per spec",
+  );
   const bare = aliases.map((w) => w.name);
-  assertEquals(new Set(bare).size, bare.length, "no two specs may share an alias name");
+  assertEquals(
+    new Set(bare).size,
+    bare.length,
+    "no two specs may share an alias name",
+  );
 });
 
 Deno.test("delete updates managed rather than leaving it claiming a live token", async () => {
@@ -1179,7 +1230,6 @@ Deno.test("propagate job runs only after a succeeded rotate", async () => {
   assertEquals(steps.length, 1);
   assertEquals(steps[0].allowFailure, false);
 });
-
 
 // 2026.08.29.1 shipped a `trigger:` in this file, so installing the extension
 // registered a daily job on every host — at a time this author picked, against
@@ -1283,3 +1333,94 @@ Deno.test("valid-target reports a malformed baseUrl the operator did supply", ()
 function result_errors(r: { pass: boolean; errors?: string[] }): string[] {
   return r.errors ?? [];
 }
+
+// --- instance names and expiry (2026.11.19.1) -------------------------------
+
+Deno.test("no two writes of one create or rotate share an instance name", async () => {
+  for (const method of ["create", "rotate"] as const) {
+    const { ctx, writes } = makeContext(G);
+    await withMockedFetch(
+      () =>
+        new Response(
+          JSON.stringify({
+            id: 99,
+            name: "n",
+            scopes: ["api"],
+            token: "glpat-x",
+          }),
+          { status: 200 },
+        ),
+      () =>
+        method === "create"
+          ? model.methods.create.execute(
+            { name: "n", scopes: ["self_rotate"], accessLevel: "maintainer" },
+            ctx,
+          )
+          : model.methods.rotate.execute({ when: true }, ctx),
+    );
+    const names = writes.map((w) => w.name);
+    assertEquals(new Set(names).size, names.length, `${method}: ${names}`);
+    assertEquals(names.sort(), ["99", "current", "managed", "secret-99"]);
+  }
+});
+
+Deno.test("secretName never equals the bare token id", () => {
+  assertEquals(secretName("99"), "secret-99");
+});
+
+Deno.test("resolveExpiry prefers the date, then days from today in UTC", () => {
+  const now = new Date("2026-11-19T23:30:00Z");
+  assertEquals(resolveExpiry({}, now), undefined);
+  assertEquals(resolveExpiry({ expiresAt: "" }, now), undefined);
+  assertEquals(resolveExpiry({ expiresInDays: 90 }, now), "2027-02-17");
+  assertEquals(
+    resolveExpiry({ expiresAt: "", expiresInDays: 90 }, now),
+    "2027-02-17",
+  );
+  assertEquals(
+    resolveExpiry({ expiresAt: "2026-12-01", expiresInDays: 90 }, now),
+    "2026-12-01",
+  );
+  // Month and year roll over.
+  assertEquals(
+    resolveExpiry({ expiresInDays: 1 }, new Date("2026-12-31T12:00:00Z")),
+    "2027-01-01",
+  );
+});
+
+Deno.test("rotate sends no expires_at for an empty expiresAt and no days", async () => {
+  const { ctx } = makeContext(G);
+  let body: Record<string, unknown> = { untouched: true };
+  await withMockedFetch(
+    (_u, init) => {
+      body = JSON.parse(String(init.body));
+      return new Response(JSON.stringify({ id: 99, token: "t" }), {
+        status: 200,
+      });
+    },
+    () => model.methods.rotate.execute({ expiresAt: "", when: true }, ctx),
+  );
+  assertEquals("expires_at" in body, false);
+});
+
+Deno.test("rotate sends a computed expires_at for expiresInDays", async () => {
+  const { ctx } = makeContext(G);
+  let body: Record<string, unknown> = {};
+  await withMockedFetch(
+    (_u, init) => {
+      body = JSON.parse(String(init.body));
+      return new Response(JSON.stringify({ id: 99, token: "t" }), {
+        status: 200,
+      });
+    },
+    () =>
+      model.methods.rotate.execute(
+        { expiresAt: "", expiresInDays: 90, when: true },
+        ctx,
+      ),
+  );
+  assertEquals(
+    body.expires_at,
+    resolveExpiry({ expiresInDays: 90 }, new Date()),
+  );
+});
