@@ -195,9 +195,15 @@ const CreateArgsSchema = z.object({
 /** Arguments for rotating an existing token. */
 const RotateArgsSchema = z.object({
   expiresAt: z.string().optional().describe(
-    "Expiry date for the replacement token as YYYY-MM-DD. Omit to take " +
-      "GitLab's default, which is one week where an expiry is mandatory and " +
+    "Expiry date for the replacement token as YYYY-MM-DD. Omit, or pass an " +
+      "empty string, to fall back to expiresInDays and then to GitLab's default, which is one week where an expiry is mandatory and " +
       "the maximum allowable lifetime otherwise.",
+  ),
+  expiresInDays: z.number().int().min(1).max(365).optional().describe(
+    "Expiry for the replacement as a number of days from today (UTC). Used " +
+      "only when expiresAt is absent or empty. A scheduled rotation should set " +
+      "one of the two: GitLab's one-week default is shorter than most rotation " +
+      "thresholds, so a run that takes it rotates again on every later run.",
   ),
   when: z.boolean().default(true).describe(
     "Rotate only when true. Exists because swamp workflows cannot express " +
@@ -507,6 +513,40 @@ type ExecuteContext = {
 const MANAGED_ALIAS = "managed";
 
 /**
+ * Instance name of the id-keyed `secret` audit copy.
+ *
+ * NOT the bare id. The `token` snapshot of the same generation is already
+ * written under the bare id in the same run, and swamp refuses one instance
+ * name written twice in a run, across specs as well as within one: "Duplicate
+ * data instance name '<id>' (already written as resource 'token' in this run)".
+ * The refusal comes after the API call, so with the bare id every create and
+ * every rotate issued a token and then lost its value.
+ */
+export function secretName(tokenId: string): string {
+  return `secret-${tokenId}`;
+}
+
+/**
+ * The expiry to send on rotate: an explicit date, else today plus
+ * `expiresInDays`, else nothing (GitLab's default). An empty `expiresAt` is
+ * treated as absent, because a workflow input that defaults to "" arrives here
+ * as "" and must not be sent as a date.
+ */
+export function resolveExpiry(
+  args: { expiresAt?: string; expiresInDays?: number },
+  now: Date,
+): string | undefined {
+  if (args.expiresAt) return args.expiresAt;
+  if (args.expiresInDays === undefined) return undefined;
+  const at = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + args.expiresInDays,
+  ));
+  return at.toISOString().slice(0, 10);
+}
+
+/**
  * Write a token snapshot twice: keyed by its real GitLab id, and under
  * {@link MANAGED_ALIAS}.
  *
@@ -742,7 +782,7 @@ export const model = {
   type: "@sntxrr/gitlab-token",
   description:
     "Create, rotate, revoke and inventory GitLab personal, project and group access tokens",
-  version: "2026.08.29.3",
+  version: "2026.11.19.1",
   // Both entries are no-ops, and each has to exist anyway: without one, an
   // instance stays pinned to its old typeVersion and never sees the release.
   //
@@ -782,6 +822,12 @@ export const model = {
       toVersion: "2026.08.29.3",
       description:
         "Fix valid-target, which failed any instance that relied on a documented default. Nothing to migrate — and an instance that wrote baseUrl or tokenScope out explicitly to work around it can now drop them, or keep them; both are correct.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.19.1",
+      description:
+        "Fix create and rotate, which issued a token and then failed the run before its value was stored: the id-keyed secret shared its instance name with the token snapshot. The audit copy is now named secret-<id>; `current` is unchanged. Add rotate's expiresInDays, and treat an empty expiresAt as absent. Nothing to migrate.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -941,7 +987,7 @@ export const model = {
           name: args.name,
           scopes: args.scopes,
         };
-        if (args.expiresAt !== undefined) body.expires_at = args.expiresAt;
+        if (args.expiresAt) body.expires_at = args.expiresAt;
         if (args.description !== undefined) body.description = args.description;
         if (g.tokenScope !== "personal") {
           body.access_level = ACCESS_LEVELS[args.accessLevel];
@@ -979,7 +1025,9 @@ export const model = {
             expiresAt: resource.expiresAt,
             observedAt,
           };
-          handles.push(await context.writeResource("secret", newId, secret));
+          handles.push(
+            await context.writeResource("secret", secretName(newId), secret),
+          );
           // The same value, written again under the stable name `current`.
           //
           // The id-keyed copy above is the audit record and must stay keyed by
@@ -1042,7 +1090,8 @@ export const model = {
           id: tokenId,
         });
         const body: Record<string, unknown> = {};
-        if (args.expiresAt !== undefined) body.expires_at = args.expiresAt;
+        const expiresAt = resolveExpiry(args, new Date());
+        if (expiresAt !== undefined) body.expires_at = expiresAt;
         const { data } = await gitlabFetch<Record<string, unknown>>(
           g,
           "POST",
@@ -1070,7 +1119,9 @@ export const model = {
             expiresAt: resource.expiresAt,
             observedAt,
           };
-          handles.push(await context.writeResource("secret", newId, secret));
+          handles.push(
+            await context.writeResource("secret", secretName(newId), secret),
+          );
           // The same value, written again under the stable name `current`.
           //
           // The id-keyed copy above is the audit record and must stay keyed by
