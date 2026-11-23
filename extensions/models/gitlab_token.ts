@@ -782,7 +782,7 @@ export const model = {
   type: "@sntxrr/gitlab-token",
   description:
     "Create, rotate, revoke and inventory GitLab personal, project and group access tokens",
-  version: "2026.11.19.1",
+  version: "2026.11.23.1",
   // Both entries are no-ops, and each has to exist anyway: without one, an
   // instance stays pinned to its old typeVersion and never sees the release.
   //
@@ -828,6 +828,12 @@ export const model = {
       toVersion: "2026.11.19.1",
       description:
         "Fix create and rotate, which issued a token and then failed the run before its value was stored: the id-keyed secret shared its instance name with the token snapshot. The audit copy is now named secret-<id>; `current` is unchanged. Add rotate's expiresInDays, and treat an empty expiresAt as absent. Nothing to migrate.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.23.1",
+      description:
+        "Fix `current`, which stored the vault reference of secret-<id> as its token text: both secret writes shared one object, and swamp replaces a sensitive field in the object it is given. Nothing to migrate; a `current` written by 2026.11.19.1 is corrected by the next rotation.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1026,7 +1032,9 @@ export const model = {
             observedAt,
           };
           handles.push(
-            await context.writeResource("secret", secretName(newId), secret),
+            await context.writeResource("secret", secretName(newId), {
+              ...secret,
+            }),
           );
           // The same value, written again under the stable name `current`.
           //
@@ -1044,7 +1052,7 @@ export const model = {
           // resolves for a consumer written long before this rotation ran. Same
           // convention as @sntxrr/credential-expiry's `audit` summary.
           handles.push(
-            await context.writeResource("secret", "current", secret),
+            await context.writeResource("secret", "current", { ...secret }),
           );
         } else {
           logger.warn(
@@ -1120,7 +1128,9 @@ export const model = {
             observedAt,
           };
           handles.push(
-            await context.writeResource("secret", secretName(newId), secret),
+            await context.writeResource("secret", secretName(newId), {
+              ...secret,
+            }),
           );
           // The same value, written again under the stable name `current`.
           //
@@ -1138,7 +1148,7 @@ export const model = {
           // resolves for a consumer written long before this rotation ran. Same
           // convention as @sntxrr/credential-expiry's `audit` summary.
           handles.push(
-            await context.writeResource("secret", "current", secret),
+            await context.writeResource("secret", "current", { ...secret }),
           );
         } else {
           // The old token is already dead at this point, so a missing value is

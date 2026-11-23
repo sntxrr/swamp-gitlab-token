@@ -76,7 +76,10 @@ function makeContext(globalArgs: Record<string, unknown> = G): {
         );
       }
       seen.set(name, spec);
-      writes.push({ spec, name, data });
+      writes.push({ spec, name, data: { ...data } });
+      // swamp replaces a sensitive field with its vault reference IN the object
+      // it was handed, so reusing that object writes the reference as a value.
+      if (spec === "secret") data.token = `vault-ref:${name}`;
       return Promise.resolve({ name });
     },
   };
